@@ -1,0 +1,84 @@
+server:
+  addr: ":8080"
+  admin_path: ""          # 留空则启动时随机生成
+  admin_path_random: true
+  read_timeout_sec: 15
+  write_timeout_sec: 60
+
+database:
+  dsn: "queryza:queryza@tcp(127.0.0.1:3306)/queryza?charset=utf8mb4&parseTime=true&loc=Local"
+  max_open_conns: 64
+  max_idle_conns: 16
+  conn_max_lifetime_sec: 300
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  pool_size: 64
+
+cluster:
+  role: standalone        # standalone | master | node
+  node_id: node-local
+  node_name: 本地节点
+  master_addr: ""
+  advertise_addr: ""
+  weight: 1
+  heartbeat_sec: 10
+  fanout_mode: all
+
+crawler:
+  enabled: true
+  mode: full              # targeted：仅种子站点；full：全网爬取并启用域名自发现
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+  timeout_sec: 10
+  max_depth: 1
+  max_pages_per_run: 300
+  concurrency: 16
+  respect_robots: true
+  seed_file: seeds/seeds.json
+  auto_start: false
+  proxy_group: ""
+  default_headers:
+    User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    Accept-Language: "zh-CN,zh;q=0.9,en;q=0.8"
+  allow_domains:
+    - www.cnblogs.com
+    - www.runoob.com
+    - www.csdn.net
+    - juejin.cn
+    - www.oschina.net
+    - www.jianshu.com
+    - www.ruanyifeng.com
+  block_domains: []
+
+search:
+  top_k: 20
+  bm25_k1: 1.2
+  bm25_b: 0.75
+  rrf_k: 60
+  keyword_weight: 1.0
+  vector_weight: 0.5
+  site_weight_w: 1.0
+  dynamic_weight_w: 0.5
+  trust_weight_w: 1.0
+  freshness_w: 0.3
+  spam_penalty_w: 2.0
+  hybrid: true
+  rerank_top_n: 100
+  snippet_len: 160
+
+embedding:
+  enabled: false          # 打开后使用 OpenAI 兼容接口生成向量
+  base_url: "https://api.openai.com/v1"
+  api_key: ""
+  model: "text-embedding-3-small"
+  dim: 1536
+  timeout_sec: 20
+
+limits:
+  max_db_docs_per_node: 1000000
+  max_redis_docs: 20000
+  max_redis_hot: 200
+  crawl_queue_max: 500000
