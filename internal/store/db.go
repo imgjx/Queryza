@@ -111,6 +111,28 @@ var schema = []string{
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
+	// 域名副本：同一域名可落在多个节点，role=primary 的副本对外提供检索
+	`CREATE TABLE IF NOT EXISTS domain_replicas (
+		domain VARCHAR(255) NOT NULL,
+		node_id VARCHAR(64) NOT NULL,
+		role VARCHAR(16) NOT NULL DEFAULT 'replica',
+		weight DOUBLE NOT NULL DEFAULT 1,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (domain, node_id),
+		KEY idx_node (node_id),
+		KEY idx_role (role)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+	// 节点加入令牌：一次性，短期有效
+	`CREATE TABLE IF NOT EXISTS node_tokens (
+		token CHAR(48) NOT NULL PRIMARY KEY,
+		node_id VARCHAR(64) NOT NULL,
+		expires_at DATETIME NOT NULL,
+		used TINYINT NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		KEY idx_node (node_id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
 	`CREATE TABLE IF NOT EXISTS api_keys (
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,
 		key_hash CHAR(64) NOT NULL,
@@ -153,6 +175,7 @@ var schema = []string{
 		error VARCHAR(512) NOT NULL DEFAULT '',
 		duration_ms INT NOT NULL DEFAULT 0,
 		node_id VARCHAR(64) NOT NULL DEFAULT '',
+		rule_id VARCHAR(32) NOT NULL DEFAULT '',
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		KEY idx_created (created_at),
 		KEY idx_domain (domain)
@@ -182,7 +205,31 @@ func (d *DB) Migrate() error {
 			return fmt.Errorf("建表失败: %w", err)
 		}
 	}
+	// 增量列：老库升级时补齐
+	for _, c := range []struct{ table, col, ddl string }{
+		{"nodes", "secret", "secret VARCHAR(64) NOT NULL DEFAULT ''"},
+		{"nodes", "enabled", "enabled TINYINT NOT NULL DEFAULT 1"},
+		{"nodes", "version", "version VARCHAR(32) NOT NULL DEFAULT ''"},
+		{"nodes", "last_ip", "last_ip VARCHAR(64) NOT NULL DEFAULT ''"},
+		{"crawl_logs", "rule_id", "rule_id VARCHAR(32) NOT NULL DEFAULT ''"},
+	} {
+		d.ensureColumn(c.table, c.col, c.ddl)
+	}
+	// 旧版单副本分配表迁移到多副本表（幂等）
+	d.Exec(`INSERT IGNORE INTO domain_replicas(domain,node_id,role,weight)
+		SELECT domain,node_id,'primary',weight FROM domain_assignments`)
 	return nil
+}
+
+func (d *DB) ensureColumn(table, col, ddl string) {
+	var n int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?`, table, col).Scan(&n); err != nil {
+		return
+	}
+	if n == 0 {
+		d.Exec("ALTER TABLE " + table + " ADD COLUMN " + ddl)
+	}
 }
 
 func (d *DB) SetConfig(k, v string) error {

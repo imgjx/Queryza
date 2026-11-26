@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"math"
+	"sort"
+	"sync"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/redis/go-redis/v9"
 
 	"queryza/internal/config"
@@ -18,6 +22,9 @@ type Indexer struct {
 	cache    *store.Cache
 	limits   config.LimitsConfig
 	embedder *Embedder
+	// writeMu 串行化索引写入：单篇文档会锁上千个 term 行，
+	// 并发事务极易交叉死锁，串行写入反而更稳且吞吐足够
+	writeMu sync.Mutex
 }
 
 func NewIndexer(db *store.DB, cache *store.Cache, limits config.LimitsConfig, embedder *Embedder) *Indexer {
@@ -27,7 +34,42 @@ func NewIndexer(db *store.DB, cache *store.Cache, limits config.LimitsConfig, em
 func (ix *Indexer) Embedder() *Embedder { return ix.embedder }
 
 // IndexDocument 写入正排、倒排、词项统计，并刷新 Redis 热数据。
+// 并发写入时多个事务会对 terms 行交叉加锁，偶发 1213 死锁，这里做有限重试。
 func (ix *Indexer) IndexDocument(ctx context.Context, doc *store.Document, tokens []string) error {
+	ix.writeMu.Lock()
+	defer ix.writeMu.Unlock()
+
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(15*attempt) * time.Millisecond):
+			}
+		}
+		err := ix.indexOnce(ctx, doc, tokens)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !retryable(err) {
+			return err
+		}
+	}
+	return lastErr
+}
+
+// retryable 判断是否为死锁 / 锁等待超时
+func retryable(err error) bool {
+	var me *mysql.MySQLError
+	if errors.As(err, &me) {
+		return me.Number == 1213 || me.Number == 1205
+	}
+	return false
+}
+
+func (ix *Indexer) indexOnce(ctx context.Context, doc *store.Document, tokens []string) error {
 	tf := make(map[string]int, len(tokens))
 	for _, t := range tokens {
 		if t != "" {
@@ -72,9 +114,27 @@ func (ix *Indexer) IndexDocument(ctx context.Context, doc *store.Document, token
 		ps.Close()
 		return err
 	}
-	for term, c := range tf {
-		ps.ExecContext(ctx, term, id, c)
-		ts.ExecContext(ctx, term)
+	// 固定加锁顺序：按 term 字典序写入，避免并发事务交叉等待形成死锁
+	terms := make([]string, 0, len(tf))
+	for t := range tf {
+		terms = append(terms, t)
+	}
+	sort.Strings(terms)
+	for _, term := range terms {
+		// term 列宽 80，超长词直接丢弃，避免整篇索引失败
+		if len([]rune(term)) > 80 {
+			continue
+		}
+		if _, err := ps.ExecContext(ctx, term, id, tf[term]); err != nil {
+			ps.Close()
+			ts.Close()
+			return err
+		}
+		if _, err := ts.ExecContext(ctx, term); err != nil {
+			ps.Close()
+			ts.Close()
+			return err
+		}
 	}
 	ps.Close()
 	ts.Close()

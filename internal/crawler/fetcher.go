@@ -13,14 +13,14 @@ import (
 )
 
 type FetchResult struct {
-	URL        string
-	FinalURL   string
-	Status     int
-	Body       []byte
+	URL         string
+	FinalURL    string
+	Status      int
+	Body        []byte
 	ContentType string
-	Err        error
-	DurationMS int
-	ViaProxy   string
+	Err         error
+	DurationMS  int
+	ViaProxy    string
 }
 
 // Fetcher 负责单页抓取：可配请求头、代理组（轮询）、robots 遵循。
@@ -33,6 +33,11 @@ type Fetcher struct {
 	clients       sync.Map // proxy -> *http.Client
 	robots        sync.Map // host -> *robotsEntry
 	noProxyClient *http.Client
+
+	// 同域最小请求间隔，避免把站点打出 429
+	gateMu   sync.Mutex
+	gateNext map[string]time.Time
+	gateGap  time.Duration
 }
 
 type robotsEntry struct {
@@ -41,12 +46,12 @@ type robotsEntry struct {
 }
 
 type robotsRule struct {
-	allow   bool
-	path    string
-	delay   time.Duration
+	allow bool
+	path  string
+	delay time.Duration
 }
 
-func NewFetcher(headers map[string]string, proxies []string, timeoutSec int, respectRobots bool) *Fetcher {
+func NewFetcher(headers map[string]string, proxies []string, timeoutSec int, respectRobots bool, perDomainMS int) *Fetcher {
 	if timeoutSec <= 0 {
 		timeoutSec = 15
 	}
@@ -55,6 +60,8 @@ func NewFetcher(headers map[string]string, proxies []string, timeoutSec int, res
 		proxies:       proxies,
 		timeout:       time.Duration(timeoutSec) * time.Second,
 		respectRobots: respectRobots,
+		gateNext:      map[string]time.Time{},
+		gateGap:       time.Duration(perDomainMS) * time.Millisecond,
 	}
 	f.noProxyClient = &http.Client{Timeout: f.timeout, Transport: f.transport("")}
 	return f
@@ -102,6 +109,12 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) *FetchResult {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		res.Err = fmt.Errorf("非法 URL")
+		res.DurationMS = int(time.Since(start).Milliseconds())
+		return res
+	}
+
+	if !f.waitDomain(ctx, u.Host) {
+		res.Err = ctx.Err()
 		res.DurationMS = int(time.Since(start).Milliseconds())
 		return res
 	}
@@ -231,4 +244,30 @@ func matchRobots(rules []robotsRule, path string) bool {
 		}
 	}
 	return allow
+}
+
+// waitDomain 保证同一域名两次请求之间至少间隔 gateGap。
+func (f *Fetcher) waitDomain(ctx context.Context, host string) bool {
+	if f.gateGap <= 0 || host == "" {
+		return true
+	}
+	f.gateMu.Lock()
+	next := f.gateNext[host]
+	now := time.Now()
+	if next.Before(now) {
+		next = now
+	}
+	f.gateNext[host] = next.Add(f.gateGap)
+	f.gateMu.Unlock()
+
+	if d := time.Until(next); d > 0 {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+		}
+	}
+	return true
 }

@@ -20,9 +20,10 @@ type Task struct {
 }
 
 type Frontier struct {
-	db     *store.DB
-	nodeID string
-	max    int
+	db      *store.DB
+	nodeID  string
+	max     int
+	domains []string // 本节点负责的域名，非空时只领取这些域名的任务
 }
 
 func NewFrontier(db *store.DB, nodeID string, max int) *Frontier {
@@ -89,6 +90,9 @@ func (f *Frontier) Enqueue(ctx context.Context, tasks []Task) (int, error) {
 	return added, nil
 }
 
+// SetDomains 限定本节点可领取的域名；传 nil 表示不限制。
+func (f *Frontier) SetDomains(ds []string) { f.domains = ds }
+
 // Lease 原子领取任务。
 func (f *Frontier) Lease(ctx context.Context, n int) ([]Task, error) {
 	if n <= 0 {
@@ -99,9 +103,18 @@ func (f *Frontier) Lease(ctx context.Context, n int) ([]Task, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT id,url,url_hash,domain,depth,priority
-		FROM crawl_queue WHERE status='pending' ORDER BY priority DESC, id ASC
-		LIMIT ? FOR UPDATE SKIP LOCKED`, n)
+	q := `SELECT id,url,url_hash,domain,depth,priority FROM crawl_queue WHERE status='pending'`
+	var args []interface{}
+	if len(f.domains) > 0 && len(f.domains) <= 800 {
+		q += ` AND domain IN (` + placeholders(len(f.domains)) + `)`
+		for _, d := range f.domains {
+			args = append(args, d)
+		}
+	}
+	q += ` ORDER BY priority DESC, id ASC LIMIT ? FOR UPDATE SKIP LOCKED`
+	args = append(args, n)
+
+	rows, err := tx.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -125,6 +138,25 @@ func (f *Frontier) Lease(ctx context.Context, n int) ([]Task, error) {
 		return nil, err
 	}
 	return tasks, nil
+}
+
+// Release 把任务放回队列（非本节点负责的域名用）
+func (f *Frontier) Release(ctx context.Context, id int64) {
+	f.db.ExecContext(ctx, `UPDATE crawl_queue SET status='pending', updated_at=NOW() WHERE id=?`, id)
+}
+
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	b := make([]byte, 0, n*2)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, '?')
+	}
+	return string(b)
 }
 
 func (f *Frontier) Done(ctx context.Context, id int64) {

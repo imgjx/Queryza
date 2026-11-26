@@ -32,8 +32,11 @@ func main() {
 	nodeID := flag.String("node-id", "", "节点 ID")
 	addr := flag.String("addr", "", "监听地址，如 :8080")
 	adminPath := flag.String("admin-path", "", "管理后台路径")
-	masterAddr := flag.String("master", "", "主节点地址（node 角色）")
+	masterAddr := flag.String("master", "", "主节点地址（node 角色），多个用逗号分隔")
 	advertise := flag.String("advertise", "", "本节点对外地址（用于注册）")
+	token := flag.String("token", "", "加入令牌（首次加入集群）")
+	secret := flag.String("secret", "", "节点通信密钥")
+	replica := flag.Int("replica", 0, "每个域名的副本数（主节点）")
 	flag.Parse()
 
 	if *showVersion {
@@ -60,7 +63,17 @@ func main() {
 		cfg.Server.AdminPath = normalizePath(*adminPath)
 	}
 	if *masterAddr != "" {
-		cfg.Cluster.MasterAddr = *masterAddr
+		cfg.Cluster.MasterAddrs = splitList(*masterAddr)
+		cfg.Cluster.MasterAddr = cfg.Cluster.MasterAddrs[0]
+	}
+	if *token != "" {
+		cfg.Cluster.Token = *token
+	}
+	if *secret != "" {
+		cfg.Cluster.Secret = *secret
+	}
+	if *replica > 0 {
+		cfg.Cluster.ReplicaFactor = *replica
 	}
 	if *advertise != "" {
 		cfg.Cluster.AdvertiseAddr = *advertise
@@ -68,6 +81,7 @@ func main() {
 	if cfg.Cluster.AdvertiseAddr == "" {
 		cfg.Cluster.AdvertiseAddr = "http://127.0.0.1" + cfg.Server.Addr
 	}
+	cfg.Cluster.Version = version
 	cfg.ApplyNodeOverride(cfg.Cluster.NodeID)
 
 	db, err := store.OpenDB(cfg.Database.DSN, cfg.Database.MaxOpenConns, cfg.Database.MaxIdleConns, cfg.Database.ConnMaxLifetime)
@@ -98,8 +112,19 @@ func main() {
 	selfCfg, _ := json.Marshal(cfg.SelfConfig())
 	master.Register(cluster.RegisterReq{
 		NodeID: cfg.Cluster.NodeID, Name: cfg.Cluster.NodeName, Addr: cfg.Cluster.AdvertiseAddr,
-		Role: cfg.Cluster.Role, Weight: cfg.Cluster.Weight, DocCount: 0, Config: string(selfCfg),
+		Role: cfg.Cluster.Role, Weight: cfg.Cluster.Weight, DocCount: 0, Config: string(selfCfg), Version: version,
 	})
+	// 域名按主副本归属：只有主副本负责抓取与入库
+	cr.SetOwnership(master)
+
+	ctx, stopContext := context.WithCancel(context.Background())
+	defer stopContext()
+	go master.StartMaintenance(ctx)
+	go func() {
+		if n := master.BackfillAssignments(ctx); n > 0 {
+			log.Printf("已为 %d 个存量域名建立副本分配", n)
+		}
+	}()
 
 	adminUser := envOr("QZ_ADMIN_USER", "admin")
 	adminPass := envOr("QZ_ADMIN_PASS", "admin123")
@@ -108,26 +133,48 @@ func main() {
 
 	srv := api.NewServer(cfg, db, cache, cr, indexer, searcher, master, keys, adminAuth, nil)
 
-	// 子节点：注册并保持心跳
-	if cfg.Cluster.Role == "node" && cfg.Cluster.MasterAddr != "" {
+	// 子节点：先领取密钥，再按主地址表注册并保持心跳
+	if cfg.Cluster.Role == "node" && len(cfg.Cluster.MasterAddrs) > 0 {
 		agent := cluster.NewAgent(cfg, cfg.Cluster.AdvertiseAddr)
+		srv.SetAgent(agent)
 		go func() {
-			ctx := context.Background()
-			if err := agent.Register(ctx, 0, string(selfCfg)); err != nil {
-				log.Printf("注册到主节点失败: %v", err)
-			} else {
-				log.Printf("已注册到主节点 %s", cfg.Cluster.MasterAddr)
+			if agent.Secret() == "" {
+				if err := agent.Enroll(ctx); err != nil {
+					log.Printf("加入集群失败: %v", err)
+				} else {
+					log.Printf("已领取节点密钥，节点 ID=%s", cfg.Cluster.NodeID)
+				}
 			}
+			report := func() {
+				dc := countOwned(db, cfg.Cluster.NodeID)
+				if err := agent.Register(ctx, dc, string(selfCfg)); err != nil {
+					log.Printf("注册失败，尝试下一个主节点地址: %v", err)
+				}
+			}
+			report()
+
 			interval := time.Duration(cfg.Cluster.HeartbeatSec) * time.Second
 			if interval <= 0 {
 				interval = 10 * time.Second
 			}
 			t := time.NewTicker(interval)
 			defer t.Stop()
-			for range t.C {
-				var dc int64
-				db.QueryRow(`SELECT COUNT(*) FROM documents`).Scan(&dc)
-				agent.Heartbeat(context.Background(), dc, string(selfCfg))
+			prefer := time.NewTicker(60 * time.Second)
+			defer prefer.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-prefer.C:
+					// 定期回到地址表首位，主入口恢复后切回去
+					agent.ResetPreference()
+					report()
+				case <-t.C:
+					dc := countOwned(db, cfg.Cluster.NodeID)
+					if err := agent.Heartbeat(ctx, dc, string(selfCfg)); err != nil {
+						log.Printf("心跳失败: %v", err)
+					}
+				}
 			}
 		}()
 	}
@@ -203,6 +250,24 @@ func normalizePath(p string) string {
 		p = "/" + p
 	}
 	return strings.TrimSuffix(p, "/")
+}
+
+// countOwned 统计本节点负责的域名下已入库的文档数
+func countOwned(db *store.DB, nodeID string) int64 {
+	var n int64
+	db.QueryRow(`SELECT COUNT(*) FROM documents d
+		JOIN domain_replicas r ON r.domain=d.domain AND r.node_id=? AND r.role='primary'`, nodeID).Scan(&n)
+	return n
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func randSuffix() string {

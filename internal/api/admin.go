@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -19,6 +20,16 @@ func (s *Server) routeAdmin(w http.ResponseWriter, r *http.Request, sub string) 
 		s.aOverview(w, r)
 	case "nodes":
 		s.aNodes(w, r)
+	case "nodes/create":
+		s.aNodeCreate(w, r)
+	case "nodes/delete":
+		s.aNodeDelete(w, r)
+	case "nodes/reset":
+		s.aNodeReset(w, r)
+	case "nodes/weight":
+		s.aNodeWeight(w, r)
+	case "rules":
+		s.aRules(w, r)
 	case "seeds":
 		s.aSeeds(w, r)
 	case "crawl/stats":
@@ -98,7 +109,103 @@ func searchMode(c *config.Config) string {
 }
 
 func (s *Server) aNodes(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]interface{}{"nodes": s.master.ListNodes()})
+	writeJSON(w, 200, map[string]interface{}{
+		"nodes":          s.master.ListNodes(),
+		"self_id":        s.cfg.Cluster.NodeID,
+		"replica_factor": s.cfg.Cluster.ReplicaFactor,
+		"require_auth":   s.cfg.Cluster.RequireAuth,
+		"join_bases":     s.joinBases(),
+	})
+}
+
+// joinBases 节点加入时使用的主节点地址（优先用地址表首项）
+func (s *Server) joinBases() []string {
+	if len(s.cfg.Cluster.MasterAddrs) > 0 {
+		return s.cfg.Cluster.MasterAddrs
+	}
+	if s.cfg.Cluster.AdvertiseAddr != "" {
+		return []string{s.cfg.Cluster.AdvertiseAddr}
+	}
+	return nil
+}
+
+func (s *Server) aNodeCreate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		NodeID string  `json:"node_id"`
+		Name   string  `json:"name"`
+		Addr   string  `json:"addr"`
+		Weight float64 `json:"weight"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, "参数错误")
+		return
+	}
+	nodeID, token, err := s.master.CreateNode(body.NodeID, body.Name, body.Addr, body.Weight)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	base := ""
+	if b := s.joinBases(); len(b) > 0 {
+		base = b[0]
+	}
+	cmd := fmt.Sprintf("./queryza -config configs/config.yaml -role node -node-id %s -master %s -token %s",
+		nodeID, base, token)
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": true, "node_id": nodeID, "token": token, "command": cmd,
+		"expires_in": 86400,
+	})
+}
+
+func (s *Server) aNodeDelete(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		NodeID string `json:"node_id"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if err := s.master.DeleteNode(body.NodeID); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+func (s *Server) aNodeReset(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		NodeID string `json:"node_id"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	token, err := s.master.ResetNodeSecret(body.NodeID)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	base := ""
+	if b := s.joinBases(); len(b) > 0 {
+		base = b[0]
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": true, "token": token,
+		"command": fmt.Sprintf("./queryza -config configs/config.yaml -role node -node-id %s -master %s -token %s",
+			body.NodeID, base, token),
+	})
+}
+
+func (s *Server) aNodeWeight(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		NodeID string  `json:"node_id"`
+		Weight float64 `json:"weight"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if err := s.master.SetNodeWeight(body.NodeID, body.Weight); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+func (s *Server) aRules(w http.ResponseWriter, r *http.Request) {
+	list := crawler.RuleList()
+	writeJSON(w, 200, map[string]interface{}{"rules": list, "total": len(list)})
 }
 
 func (s *Server) aSeeds(w http.ResponseWriter, r *http.Request) {
@@ -197,7 +304,7 @@ func (s *Server) aCrawlEnqueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) aCrawlLogs(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), `SELECT id,url,domain,status,http_code,bytes,error,duration_ms,node_id,created_at
+	rows, err := s.db.QueryContext(r.Context(), `SELECT id,url,domain,status,http_code,bytes,error,duration_ms,node_id,COALESCE(rule_id,''),created_at
 		FROM crawl_logs ORDER BY id DESC LIMIT 120`)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -207,7 +314,7 @@ func (s *Server) aCrawlLogs(w http.ResponseWriter, r *http.Request) {
 	var out []store.CrawlLog
 	for rows.Next() {
 		var l store.CrawlLog
-		if rows.Scan(&l.ID, &l.URL, &l.Domain, &l.Status, &l.HTTPCode, &l.Bytes, &l.Error, &l.DurationMS, &l.NodeID, &l.CreatedAt) == nil {
+		if rows.Scan(&l.ID, &l.URL, &l.Domain, &l.Status, &l.HTTPCode, &l.Bytes, &l.Error, &l.DurationMS, &l.NodeID, &l.RuleID, &l.CreatedAt) == nil {
 			out = append(out, l)
 		}
 	}
@@ -330,7 +437,7 @@ func (s *Server) configSnapshot() map[string]interface{} {
 			"seed_file": s.cfg.Crawler.SeedFile, "respect_robots": s.cfg.Crawler.RespectRobots,
 			"max_depth": s.cfg.Crawler.MaxDepth, "concurrency": s.cfg.Crawler.Concurrency,
 			"max_pages_per_run": s.cfg.Crawler.MaxPagesPerRun,
-			"allow_domains": s.cfg.Crawler.AllowDomains, "block_domains": s.cfg.Crawler.BlockDomains,
+			"allow_domains":     s.cfg.Crawler.AllowDomains, "block_domains": s.cfg.Crawler.BlockDomains,
 		},
 		"embedding": map[string]interface{}{
 			"enabled": s.cfg.Embedding.Enabled, "base_url": s.cfg.Embedding.BaseURL,

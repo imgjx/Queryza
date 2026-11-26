@@ -12,15 +12,15 @@ import (
 
 // Config 为系统总配置；节点未覆盖的字段一律继承此处。
 type Config struct {
-	Server    ServerConfig              `yaml:"server"`
-	Database  DatabaseConfig            `yaml:"database"`
-	Redis     RedisConfig               `yaml:"redis"`
-	Cluster   ClusterConfig             `yaml:"cluster"`
-	Crawler   CrawlerConfig             `yaml:"crawler"`
-	Search    SearchConfig              `yaml:"search"`
-	Embedding EmbeddingConfig           `yaml:"embedding"`
-	Limits    LimitsConfig              `yaml:"limits"`
-	Nodes     map[string]NodeOverride   `yaml:"nodes"`
+	Server    ServerConfig            `yaml:"server"`
+	Database  DatabaseConfig          `yaml:"database"`
+	Redis     RedisConfig             `yaml:"redis"`
+	Cluster   ClusterConfig           `yaml:"cluster"`
+	Crawler   CrawlerConfig           `yaml:"crawler"`
+	Search    SearchConfig            `yaml:"search"`
+	Embedding EmbeddingConfig         `yaml:"embedding"`
+	Limits    LimitsConfig            `yaml:"limits"`
+	Nodes     map[string]NodeOverride `yaml:"nodes"`
 	raw       map[string]interface{}
 }
 
@@ -47,31 +47,47 @@ type RedisConfig struct {
 }
 
 type ClusterConfig struct {
-	Role          string  `yaml:"role"` // standalone | master | node
-	NodeID        string  `yaml:"node_id"`
-	NodeName      string  `yaml:"node_name"`
-	MasterAddr    string  `yaml:"master_addr"`
-	AdvertiseAddr string  `yaml:"advertise_addr"`
-	Weight        float64 `yaml:"weight"`
-	HeartbeatSec  int     `yaml:"heartbeat_sec"`
-	FanoutMode    string  `yaml:"fanout_mode"` // all | weighted
+	Role       string `yaml:"role"` // standalone | master | node
+	NodeID     string `yaml:"node_id"`
+	NodeName   string `yaml:"node_name"`
+	MasterAddr string `yaml:"master_addr"`
+	// MasterAddrs 主节点地址表，按顺序尝试：CDN 入口 → 备用 CDN → 直连 IP
+	MasterAddrs   []string `yaml:"master_addrs"`
+	AdvertiseAddr string   `yaml:"advertise_addr"`
+	Weight        float64  `yaml:"weight"`
+	HeartbeatSec  int      `yaml:"heartbeat_sec"`
+	FanoutMode    string   `yaml:"fanout_mode"` // all | weighted
+	// Secret 节点与主节点之间的通信密钥（HMAC-SHA256）；写入配置即固定，否则由主节点下发
+	Secret string `yaml:"secret"`
+	// ReplicaFactor 每个域名保存的副本数，1 表示单副本
+	ReplicaFactor int `yaml:"replica_factor"`
+	// RequireAuth 是否强制校验节点签名
+	RequireAuth bool `yaml:"require_auth"`
+	// IdentityFile 节点身份文件（保存下发的主节点地址、节点 ID 与密钥）
+	IdentityFile string `yaml:"identity_file"`
+	// Token 加入令牌，仅用于首次 enroll
+	Token string `yaml:"token"`
+	// Version 由主程序写入，随注册上报
+	Version string `yaml:"-"`
 }
 
 type CrawlerConfig struct {
-	Enabled        bool              `yaml:"enabled"`
-	Mode           string            `yaml:"mode"` // full | targeted
-	UserAgent      string            `yaml:"user_agent"`
-	TimeoutSec     int               `yaml:"timeout_sec"`
-	MaxDepth       int               `yaml:"max_depth"`
-	MaxPagesPerRun int               `yaml:"max_pages_per_run"`
-	Concurrency    int               `yaml:"concurrency"`
-	RespectRobots  bool              `yaml:"respect_robots"`
-	DefaultHeaders map[string]string `yaml:"default_headers"`
-	ProxyGroup     string            `yaml:"proxy_group"`
-	AllowDomains   []string          `yaml:"allow_domains"`
-	BlockDomains   []string          `yaml:"block_domains"`
-	SeedFile       string            `yaml:"seed_file"`
-	AutoStart      bool              `yaml:"auto_start"`
+	Enabled        bool   `yaml:"enabled"`
+	Mode           string `yaml:"mode"` // full | targeted
+	UserAgent      string `yaml:"user_agent"`
+	TimeoutSec     int    `yaml:"timeout_sec"`
+	MaxDepth       int    `yaml:"max_depth"`
+	MaxPagesPerRun int    `yaml:"max_pages_per_run"`
+	Concurrency    int    `yaml:"concurrency"`
+	RespectRobots  bool   `yaml:"respect_robots"`
+	// PerDomainIntervalMS 同一域名两次请求的最小间隔（毫秒），0 表示不限制
+	PerDomainIntervalMS int               `yaml:"per_domain_interval_ms"`
+	DefaultHeaders      map[string]string `yaml:"default_headers"`
+	ProxyGroup          string            `yaml:"proxy_group"`
+	AllowDomains        []string          `yaml:"allow_domains"`
+	BlockDomains        []string          `yaml:"block_domains"`
+	SeedFile            string            `yaml:"seed_file"`
+	AutoStart           bool              `yaml:"auto_start"`
 }
 
 type SearchConfig struct {
@@ -101,10 +117,10 @@ type EmbeddingConfig struct {
 }
 
 type LimitsConfig struct {
-	MaxDBDocsPerNode  int `yaml:"max_db_docs_per_node"`
-	MaxRedisDocs      int `yaml:"max_redis_docs"`
-	MaxRedisHot       int `yaml:"max_redis_hot"`
-	CrawlQueueMax     int `yaml:"crawl_queue_max"`
+	MaxDBDocsPerNode int `yaml:"max_db_docs_per_node"`
+	MaxRedisDocs     int `yaml:"max_redis_docs"`
+	MaxRedisHot      int `yaml:"max_redis_hot"`
+	CrawlQueueMax    int `yaml:"crawl_queue_max"`
 }
 
 // NodeOverride 节点级覆盖：只写需要覆盖的字段。
@@ -122,14 +138,17 @@ func defaults() *Config {
 	return &Config{
 		Server: ServerConfig{Addr: ":8080", AdminPath: "", AdminPathRandom: true, ReadTimeoutSec: 15, WriteTimeoutSec: 60},
 		Database: DatabaseConfig{
-			DSN: "queryza:queryza@tcp(127.0.0.1:3306)/queryza?charset=utf8mb4&parseTime=true&loc=Local",
+			DSN:          "queryza:queryza@tcp(127.0.0.1:3306)/queryza?charset=utf8mb4&parseTime=true&loc=Local",
 			MaxOpenConns: 64, MaxIdleConns: 16, ConnMaxLifetime: 300,
 		},
 		Redis: RedisConfig{Addr: "127.0.0.1:6379", DB: 0, PoolSize: 64},
-		Cluster: ClusterConfig{Role: "standalone", NodeID: "node-local", NodeName: "本地节点", Weight: 1, HeartbeatSec: 10, FanoutMode: "all"},
+		Cluster: ClusterConfig{
+			Role: "standalone", NodeID: "node-local", NodeName: "本地节点", Weight: 1, HeartbeatSec: 10,
+			FanoutMode: "all", ReplicaFactor: 1, RequireAuth: true, IdentityFile: "data/node_identity.json",
+		},
 		Crawler: CrawlerConfig{
 			Enabled: true, Mode: "targeted", TimeoutSec: 15, MaxDepth: 2, MaxPagesPerRun: 200,
-			Concurrency: 8, RespectRobots: true, SeedFile: "seeds/seeds.json",
+			Concurrency: 8, RespectRobots: true, SeedFile: "seeds/seeds.json", PerDomainIntervalMS: 250,
 			DefaultHeaders: map[string]string{
 				"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
 				"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -175,6 +194,15 @@ func (c *Config) normalize() {
 	}
 	if c.Cluster.FanoutMode == "" {
 		c.Cluster.FanoutMode = "all"
+	}
+	if c.Cluster.ReplicaFactor <= 0 {
+		c.Cluster.ReplicaFactor = 1
+	}
+	if len(c.Cluster.MasterAddrs) == 0 && c.Cluster.MasterAddr != "" {
+		c.Cluster.MasterAddrs = []string{c.Cluster.MasterAddr}
+	}
+	if c.Cluster.IdentityFile == "" {
+		c.Cluster.IdentityFile = "data/node_identity.json"
 	}
 }
 
@@ -225,15 +253,15 @@ func (c *Config) ApplyNodeOverride(nodeID string) {
 // SelfConfig 返回节点自身覆盖后的快照（供 API 展示）。
 func (c *Config) SelfConfig() map[string]interface{} {
 	return map[string]interface{}{
-		"role":          c.Cluster.Role,
-		"node_id":       c.Cluster.NodeID,
-		"node_name":     c.Cluster.NodeName,
-		"weight":        c.Cluster.Weight,
-		"crawler_mode":  c.Crawler.Mode,
-		"crawler_on":    c.Crawler.Enabled,
-		"proxy_group":   c.Crawler.ProxyGroup,
-		"headers":       c.Crawler.DefaultHeaders,
-		"max_db_docs":   c.Limits.MaxDBDocsPerNode,
+		"role":           c.Cluster.Role,
+		"node_id":        c.Cluster.NodeID,
+		"node_name":      c.Cluster.NodeName,
+		"weight":         c.Cluster.Weight,
+		"crawler_mode":   c.Crawler.Mode,
+		"crawler_on":     c.Crawler.Enabled,
+		"proxy_group":    c.Crawler.ProxyGroup,
+		"headers":        c.Crawler.DefaultHeaders,
+		"max_db_docs":    c.Limits.MaxDBDocsPerNode,
 		"max_redis_docs": c.Limits.MaxRedisDocs,
 	}
 }

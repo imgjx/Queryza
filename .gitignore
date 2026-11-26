@@ -10,8 +10,14 @@ algo/*.so
 # 运行日志
 *.log
 
+# 节点身份（含通信密钥，绝不入库）
+/data/
+
 # 编辑器 / 系统
 .idea/
 .vscode/
 .DS_Store
 *.swp
+
+# 节点身份（含通信密钥，不入库）
+/data/

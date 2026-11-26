@@ -22,6 +22,12 @@ type Indexer interface {
 	IndexDocument(ctx context.Context, doc *store.Document, tokens []string) error
 }
 
+// Ownership 判断域名是否由本节点负责（主副本），用于多节点分片。
+type Ownership interface {
+	OwnDomain(domain string) bool
+	OwnedDomains() []string
+}
+
 type Crawler struct {
 	cfg      *config.Config
 	db       *store.DB
@@ -30,23 +36,25 @@ type Crawler struct {
 	fetcher  *Fetcher
 	frontier *Frontier
 	indexer  Indexer
+	owner    Ownership
 
 	mu      sync.Mutex
 	running bool
 	stat    struct {
 		fetched, indexed, failed, discovered int64
-		lastErr                               string
-		lastAt                                time.Time
+		lastErr                              string
+		lastAt                               time.Time
 	}
 }
 
 func New(cfg *config.Config, db *store.DB, cache *store.Cache, nodeID string, proxies []string, indexer Indexer) *Crawler {
 	return &Crawler{
-		cfg:      cfg,
-		db:       db,
-		cache:    cache,
-		nodeID:   nodeID,
-		fetcher:  NewFetcher(cfg.Crawler.DefaultHeaders, proxies, cfg.Crawler.TimeoutSec, cfg.Crawler.RespectRobots),
+		cfg:    cfg,
+		db:     db,
+		cache:  cache,
+		nodeID: nodeID,
+		fetcher: NewFetcher(cfg.Crawler.DefaultHeaders, proxies, cfg.Crawler.TimeoutSec,
+			cfg.Crawler.RespectRobots, cfg.Crawler.PerDomainIntervalMS),
 		frontier: NewFrontier(db, nodeID, cfg.Limits.CrawlQueueMax),
 		indexer:  indexer,
 	}
@@ -166,6 +174,9 @@ func (c *Crawler) Run(ctx context.Context) {
 			continue
 		}
 
+		if c.owner != nil {
+			c.frontier.SetDomains(c.owner.OwnedDomains())
+		}
 		tasks, err := c.frontier.Lease(ctx, conc)
 		if err != nil || len(tasks) == 0 {
 			time.Sleep(800 * time.Millisecond)
@@ -190,9 +201,23 @@ func (c *Crawler) process(ctx context.Context, t Task) {
 		c.frontier.Done(ctx, t.ID)
 		return
 	}
+	// 多节点下域名按主副本归属：非主副本不重复抓取同一份数据
+	if !c.owns(t.Domain) {
+		c.frontier.Release(ctx, t.ID)
+		return
+	}
 	res := c.fetcher.Fetch(ctx, t.URL)
 
-	c.logFetch(ctx, t, res)
+	// 先解析，日志里带上命中的清洗规则，便于观察规则库效果
+	var page *Page
+	ruleID := ""
+	okBody := res.Err == nil && res.Status >= 200 && res.Status < 400 &&
+		(res.ContentType == "" || strings.Contains(strings.ToLower(res.ContentType), "html"))
+	if okBody {
+		page = Parse(t.URL, res.Body)
+		ruleID = page.Rule
+	}
+	c.logFetch(ctx, t, res, ruleID)
 
 	c.mu.Lock()
 	c.stat.fetched++
@@ -211,13 +236,16 @@ func (c *Crawler) process(ctx context.Context, t Task) {
 		c.frontier.Fail(ctx, t.ID, 0)
 		return
 	}
-	if res.ContentType != "" && !strings.Contains(strings.ToLower(res.ContentType), "html") {
+	if page == nil {
 		c.frontier.Done(ctx, t.ID)
 		return
 	}
-
-	page := Parse(t.URL, res.Body)
 	if len(page.Text) < 30 {
+		c.frontier.Done(ctx, t.ID)
+		return
+	}
+	// 导航页 / 列表页：没定位到正文容器且链接文字占比高，不入索引（链接仍参与扩散）
+	if !page.Confident && page.LinkDensity > 0.45 {
 		c.frontier.Done(ctx, t.ID)
 		return
 	}
@@ -291,7 +319,7 @@ func (c *Crawler) domainWeight(ctx context.Context, domain string) float64 {
 	return 1.0
 }
 
-func (c *Crawler) logFetch(ctx context.Context, t Task, res *FetchResult) {
+func (c *Crawler) logFetch(ctx context.Context, t Task, res *FetchResult, ruleID string) {
 	errStr := ""
 	if res.Err != nil {
 		errStr = res.Err.Error()
@@ -299,8 +327,8 @@ func (c *Crawler) logFetch(ctx context.Context, t Task, res *FetchResult) {
 	if len(errStr) > 500 {
 		errStr = errStr[:500]
 	}
-	c.db.ExecContext(ctx, `INSERT INTO crawl_logs(url,domain,status,http_code,bytes,error,duration_ms,node_id)
-		VALUES(?,?,?,?,?,?,?,?)`, t.URL, t.Domain, statusOf(res), res.Status, len(res.Body), errStr, res.DurationMS, c.nodeID)
+	c.db.ExecContext(ctx, `INSERT INTO crawl_logs(url,domain,status,http_code,bytes,error,duration_ms,node_id,rule_id)
+		VALUES(?,?,?,?,?,?,?,?,?)`, t.URL, t.Domain, statusOf(res), res.Status, len(res.Body), errStr, res.DurationMS, c.nodeID, ruleID)
 }
 
 func statusOf(res *FetchResult) string {
@@ -341,6 +369,16 @@ func (c *Crawler) EnqueueURLs(ctx context.Context, urls []string, depth, priorit
 }
 
 func (c *Crawler) Frontier() *Frontier { return c.frontier }
+
+// SetOwnership 设置域名归属判断；为空表示单机模式，全部由本节点处理。
+func (c *Crawler) SetOwnership(o Ownership) { c.owner = o }
+
+func (c *Crawler) owns(domain string) bool {
+	if c.owner == nil {
+		return true
+	}
+	return c.owner.OwnDomain(domain)
+}
 
 func simhash64(tokens []string) int64 {
 	var v [64]int

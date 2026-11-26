@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -49,13 +51,18 @@ func NewServer(cfg *config.Config, db *store.DB, cache *store.Cache, cw *crawler
 	}
 }
 
+// SetAgent 绑定子节点 Agent，供后台显示连接状态。
+func (s *Server) SetAgent(a *cluster.Agent) { s.agent = a }
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/internal/enroll", s.handleEnroll)
 	mux.HandleFunc("/internal/register", s.handleRegister)
 	mux.HandleFunc("/internal/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("/internal/search", s.handleInternalSearch)
 	mux.HandleFunc("/internal/assign", s.handleAssign)
+	mux.HandleFunc("/internal/ping", s.handlePing)
 
 	mux.HandleFunc("/api/v1/", s.routeAPI)
 
@@ -96,38 +103,154 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 内部接口 ----------
 
-func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+// requireInternal 读取请求体并校验节点签名，返回节点 ID。
+// 密钥为节点各自的密钥：主节点按节点 ID 查库，子节点用自身密钥。
+func (s *Server) requireInternal(w http.ResponseWriter, r *http.Request) (string, []byte, bool) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		writeErr(w, 400, "读取请求体失败")
+		return "", nil, false
+	}
+	r.Body.Close()
+	if !s.cfg.Cluster.RequireAuth {
+		return r.Header.Get(cluster.HdrNode), body, true
+	}
+	nodeID, err := cluster.VerifyRequest(r, body, func(id string) (string, error) {
+		if id == s.cfg.Cluster.NodeID {
+			return s.cfg.Cluster.Secret, nil
+		}
+		return s.master.NodeSecret(id)
+	})
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return "", nil, false
+	}
+	return nodeID, body, true
+}
+
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if i := strings.IndexByte(v, ','); i > 0 {
+			return strings.TrimSpace(v[:i])
+		}
+		return strings.TrimSpace(v)
+	}
+	if v := r.Header.Get("X-Real-IP"); v != "" {
+		return v
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	var req cluster.RegisterReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 200, cluster.EnrollResp{OK: false, Err: "请求格式错误"})
+		return
+	}
+	nodeID, secret, err := s.master.Enroll(req.Token)
+	if err != nil {
+		writeJSON(w, 200, cluster.EnrollResp{OK: false, Err: err.Error()})
+		return
+	}
+	writeJSON(w, 200, cluster.EnrollResp{
+		OK: true, NodeID: nodeID, Secret: secret, MasterID: s.cfg.Cluster.NodeID,
+	})
+}
+
+func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": true, "node_id": s.cfg.Cluster.NodeID, "role": s.cfg.Cluster.Role,
+	})
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	nodeID, body, ok := s.requireInternal(w, r)
+	if !ok {
+		return
+	}
+	var req cluster.RegisterReq
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeErr(w, 400, "bad request")
 		return
 	}
-	s.master.Register(req)
-	writeJSON(w, 200, map[string]interface{}{"ok": true})
+	if req.NodeID == "" {
+		req.NodeID = nodeID
+	}
+	if req.NodeID != nodeID {
+		writeErr(w, 403, "节点标识与签名不一致")
+		return
+	}
+	req.IP = clientIP(r)
+	if err := s.master.Register(req); err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "master": s.cfg.Cluster.NodeID})
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	nodeID, body, ok := s.requireInternal(w, r)
+	if !ok {
+		return
+	}
 	var req cluster.RegisterReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeErr(w, 400, "bad request")
 		return
 	}
-	s.master.Heartbeat(req.NodeID, req.DocCount, req.Config)
+	id := req.NodeID
+	if id == "" {
+		id = nodeID
+	}
+	if err := s.master.Heartbeat(id, req.DocCount, req.Config, req.Version, clientIP(r)); err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return
+	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
 }
 
 func (s *Server) handleInternalSearch(w http.ResponseWriter, r *http.Request) {
+	nodeID, body, ok := s.requireInternal(w, r)
+	if !ok {
+		return
+	}
 	var req cluster.InternalSearchReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeJSON(w, 200, cluster.InternalSearchResp{OK: false, Err: "bad request"})
 		return
 	}
-	res, err := s.searcher.SearchLocal(r.Context(), req.Query, req.TopK)
+	// 只在本节点负责的域名内召回，主节点按副本归并，避免同一文档被多节点重复返回
+	_ = nodeID
+	allow := s.ownedDomains()
+	if len(req.Domains) > 0 {
+		// 主节点指定代查域名（副本接管故障节点）
+		allow = make(map[string]bool, len(req.Domains))
+		for _, d := range req.Domains {
+			allow[d] = true
+		}
+	}
+	res, err := s.searcher.SearchLocalWithin(r.Context(), req.Query, req.TopK, allow)
 	if err != nil {
 		writeJSON(w, 200, cluster.InternalSearchResp{OK: false, Err: err.Error()})
 		return
 	}
 	writeJSON(w, 200, cluster.InternalSearchResp{OK: true, Result: res})
+}
+
+func (s *Server) ownedDomains() map[string]bool {
+	list := s.master.DomainsOf(s.cfg.Cluster.NodeID)
+	if len(list) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(list))
+	for _, d := range list {
+		out[d] = true
+	}
+	return out
 }
 
 func (s *Server) handleAssign(w http.ResponseWriter, r *http.Request) {

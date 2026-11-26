@@ -30,17 +30,32 @@ func New(db *store.DB, cache *store.Cache, cfg config.SearchConfig, embedder *in
 }
 
 type Result struct {
-	Query  string             `json:"query"`
-	Tokens []string           `json:"tokens"`
-	Mode   string             `json:"mode"`
-	Total  int                `json:"total"`
-	TookMS int                `json:"took_ms"`
-	Hits   []store.SearchHit  `json:"hits"`
-	Cached bool               `json:"cached"`
-	NodeID string             `json:"node_id"`
+	Query  string            `json:"query"`
+	Tokens []string          `json:"tokens"`
+	Mode   string            `json:"mode"`
+	Total  int               `json:"total"`
+	TookMS int               `json:"took_ms"`
+	Hits   []store.SearchHit `json:"hits"`
+	Cached bool              `json:"cached"`
+	NodeID string            `json:"node_id"`
+	// Degraded 记录本次检索失败的节点，便于观察集群健康
+	Degraded []string `json:"degraded,omitempty"`
 }
 
 func (s *Searcher) SearchLocal(ctx context.Context, query string, topK int) (*Result, error) {
+	return s.search(ctx, query, topK, nil)
+}
+
+// SearchLocalWithin 只在本节点负责的域名内检索。
+// allow 为 nil 表示不限制；空 map 表示一个域名都不属于本节点，直接返回空。
+func (s *Searcher) SearchLocalWithin(ctx context.Context, query string, topK int, allow map[string]bool) (*Result, error) {
+	if allow != nil && len(allow) == 0 {
+		return &Result{Query: query, Hits: []store.SearchHit{}, NodeID: s.nodeID}, nil
+	}
+	return s.search(ctx, query, topK, allow)
+}
+
+func (s *Searcher) search(ctx context.Context, query string, topK int, allow map[string]bool) (*Result, error) {
 	start := time.Now()
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -51,7 +66,8 @@ func (s *Searcher) SearchLocal(ctx context.Context, query string, topK int) (*Re
 	}
 
 	ck := "qz:q:" + hashHex(s.nodeID+"|"+query+"|"+fmt.Sprint(topK))
-	if s.cache != nil {
+	// 带域名过滤时结果依赖副本分配，不走共享缓存
+	if s.cache != nil && allow == nil {
 		if b, ok := s.cache.GetJSON(ctx, ck); ok {
 			var r Result
 			if json.Unmarshal(b, &r) == nil {
@@ -156,7 +172,7 @@ func (s *Searcher) SearchLocal(ctx context.Context, query string, topK int) (*Re
 	}
 	ids := topN(cand, limit)
 
-	hits, err := s.loadHits(ctx, ids, cand, kw, vec, tokens)
+	hits, err := s.loadHits(ctx, ids, cand, kw, vec, tokens, allow)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +184,7 @@ func (s *Searcher) SearchLocal(ctx context.Context, query string, topK int) (*Re
 	}
 
 	res := &Result{Query: query, Tokens: tokens, Mode: mode, Total: total, TookMS: int(time.Since(start).Milliseconds()), Hits: hits, NodeID: s.nodeID}
-	if s.cache != nil {
+	if s.cache != nil && allow == nil {
 		if b, err := json.Marshal(res); err == nil {
 			s.cache.SetJSON(ctx, ck, b, 60*time.Second)
 		}
@@ -177,7 +193,7 @@ func (s *Searcher) SearchLocal(ctx context.Context, query string, topK int) (*Re
 	return res, nil
 }
 
-func (s *Searcher) loadHits(ctx context.Context, ids []int64, cand, kw, vec map[int64]float64, tokens []string) ([]store.SearchHit, error) {
+func (s *Searcher) loadHits(ctx context.Context, ids []int64, cand, kw, vec map[int64]float64, tokens []string, allow map[string]bool) ([]store.SearchHit, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -201,6 +217,9 @@ func (s *Searcher) loadHits(ctx context.Context, ids []int64, cand, kw, vec map[
 		var fetched time.Time
 		var site, dyn, trust, spam float64
 		if err := rows.Scan(&id, &url, &title, &domain, &content, &fetched, &site, &dyn, &trust, &spam); err != nil {
+			continue
+		}
+		if allow != nil && !allow[domain] {
 			continue
 		}
 		age := time.Since(fetched).Hours() / 24

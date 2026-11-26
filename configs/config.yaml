@@ -21,21 +21,30 @@ cluster:
   role: standalone        # standalone | master | node
   node_id: node-local
   node_name: 本地节点
+  # 主节点地址表：按顺序尝试，前一个连不上自动切下一个
+  # 例：https://cdn-a.example.com   https://cdn-b.example.com   http://10.0.0.1:8080
   master_addr: ""
+  master_addrs: []
   advertise_addr: ""
   weight: 1
   heartbeat_sec: 10
   fanout_mode: all
+  replica_factor: 1       # 每个域名在几个节点上各存一份；检索只走主副本
+  require_auth: true      # 节点内部接口强制 HMAC 签名
+  identity_file: data/node_identity.json
+  token: ""               # 加入令牌，仅首次加入时通过 -token 传入
+  secret: ""              # 留空则主节点自动生成并下发
 
 crawler:
   enabled: true
   mode: full              # targeted：仅种子站点；full：全网爬取并启用域名自发现
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
   timeout_sec: 10
-  max_depth: 1
-  max_pages_per_run: 300
-  concurrency: 16
+  max_depth: 2
+  max_pages_per_run: 2000
+  concurrency: 24
   respect_robots: true
+  per_domain_interval_ms: 400   # 同域请求最小间隔，防 429
   seed_file: seeds/seeds.json
   auto_start: false
   proxy_group: ""
@@ -51,6 +60,21 @@ crawler:
     - www.oschina.net
     - www.jianshu.com
     - www.ruanyifeng.com
+    - www.liaoxuefeng.com
+    - segmentfault.com
+    - www.51cto.com
+    - sspai.com
+    - www.ithome.com
+    - 36kr.com
+    - www.infoq.cn
+    - www.v2ex.com
+    - www.douban.com
+    - www.zhihu.com
+    - www.hupu.com
+    - www.smzdm.com
+    - www.qbitai.com
+    - www.thepaper.cn
+    - www.guokr.com
   block_domains: []
 
 search:

@@ -146,6 +146,10 @@ tbody tr:last-child td{border-bottom:none}
 .kv dt{color:var(--muted)}
 .kv dd{margin:0;font-weight:500}
 .node-card{position:relative;overflow:hidden}
+.btn.sm{padding:6px 10px;font-size:12px;border-radius:8px}
+.btn.danger{color:#dc2626;border-color:#fecaca}
+.btn.danger:hover{background:#fef2f2}
+.btn:disabled{opacity:.45;cursor:not-allowed}
 .node-card .top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px}
 .node-card .nm{font-size:15px;font-weight:600}
 .node-card .addr{font-size:11.5px;color:var(--muted);margin-top:3px}
@@ -445,10 +449,11 @@ tbody tr:last-child td{border-bottom:none}
             <button class="btn" @click="loadLogs">刷新</button></div>
           <div class="panel">
             <table>
-              <thead><tr><th>状态</th><th>URL</th><th>HTTP</th><th>大小</th><th>耗时</th><th>时间</th></tr></thead>
+              <thead><tr><th>状态</th><th>规则</th><th>URL</th><th>HTTP</th><th>大小</th><th>耗时</th><th>时间</th></tr></thead>
               <tbody>
                 <tr v-for="l in logs" :key="l.id">
                   <td><span class="badge" :class="l.status==='ok'?'ok':'err'">{{ l.status }}</span></td>
+                  <td><span class="badge gray mono" style="font-size:11px">{{ l.rule_id || '—' }}</span></td>
                   <td><span class="ellip mono" style="max-width:380px" :title="l.url">{{ l.url }}</span>
                       <span v-if="l.error" class="ellip" style="font-size:11px;color:#dc2626">{{ l.error }}</span></td>
                   <td class="mono">{{ l.http_code||'—' }}</td>
@@ -456,7 +461,7 @@ tbody tr:last-child td{border-bottom:none}
                   <td class="mono">{{ l.duration_ms }}ms</td>
                   <td class="muted" style="font-size:12px">{{ fmtTime(l.created_at) }}</td>
                 </tr>
-                <tr v-if="!logs.length"><td colspan="6" class="empty">暂无日志</td></tr>
+                <tr v-if="!logs.length"><td colspan="7" class="empty">暂无日志</td></tr>
               </tbody>
             </table>
           </div>
@@ -464,19 +469,32 @@ tbody tr:last-child td{border-bottom:none}
 
         <!-- 节点 -->
         <section v-if="page==='nodes'">
-          <div class="page-head"><div><h2>集群节点</h2><p>中心调度与子节点健康状态</p></div>
-            <button class="btn" @click="loadNodes">刷新</button></div>
+          <div class="page-head">
+            <div><h2>集群节点</h2><p>节点只提供算力与存储、不带界面；在此创建后把加入命令拷到目标机器执行</p></div>
+            <div class="row" style="gap:8px">
+              <span class="badge gray">副本数 {{ nodeMeta.replica_factor || 1 }}</span>
+              <span class="badge" :class="nodeMeta.require_auth?'ok':'warn'">{{ nodeMeta.require_auth ? '签名校验已开启' : '签名校验已关闭' }}</span>
+              <button class="btn" @click="loadNodes">刷新</button>
+              <button class="btn primary" @click="openNodeModal">添加节点</button>
+            </div>
+          </div>
           <div class="grid cards">
             <div class="card node-card" v-for="n in nodes" :key="n.node_id">
               <div class="top">
                 <div><div class="nm">{{ n.name || n.node_id }} <span class="badge gray" style="margin-left:6px">{{ n.role }}</span></div>
                   <div class="addr mono">{{ n.addr || '—' }}</div></div>
-                <span class="badge" :class="n.status==='online'?'ok':'err'">{{ n.status==='online'?'在线':'离线' }}</span>
+                <span class="badge" :class="n.status==='online'?'ok':(n.status==='disabled'?'warn':'err')">
+                  {{ n.status==='online'?'在线':(n.status==='disabled'?'待加入':'离线') }}</span>
               </div>
               <div class="node-metrics">
                 <div><b>{{ fmt(n.doc_count) }}</b>文档</div>
                 <div><b>{{ n.weight }}</b>权重</div>
-                <div><b v-if="n.is_self">本机</b><b v-else>—</b>标识</div>
+                <div><b class="mono" style="font-size:12px">{{ n.last_ip || '—' }}</b>来源 IP</div>
+              </div>
+              <div class="row" style="margin-top:14px;gap:8px">
+                <button class="btn sm" @click="setNodeWeight(n)">权重</button>
+                <button class="btn sm" @click="resetNode(n)" :disabled="n.is_self">重置密钥</button>
+                <button class="btn sm danger" @click="delNode(n)" :disabled="n.is_self">删除</button>
               </div>
             </div>
             <div v-if="!nodes.length" class="card empty">暂无节点</div>
@@ -489,14 +507,45 @@ tbody tr:last-child td{border-bottom:none}
             <button class="btn" @click="loadAssign">刷新</button></div>
           <div class="panel">
             <table>
-              <thead><tr><th>域名</th><th>归属节点</th><th>权重</th></tr></thead>
+              <thead><tr><th>域名</th><th>节点</th><th>角色</th><th>权重</th></tr></thead>
               <tbody>
-                <tr v-for="a in assignments" :key="a.domain">
+                <tr v-for="a in assignments" :key="a.domain + a.node_id">
                   <td><span class="badge gray">{{ a.domain }}</span></td>
                   <td class="mono">{{ a.node_id }}</td>
+                  <td>
+                    <span class="badge" :class="a.role==='primary'?'ok':'gray'">{{ a.role==='primary'?'主副本':'副本' }}</span>
+                  </td>
                   <td class="mono">{{ a.weight }}</td>
                 </tr>
-                <tr v-if="!assignments.length"><td colspan="3" class="empty">暂无分配记录（抓取时自动生成）</td></tr>
+                <tr v-if="!assignments.length"><td colspan="4" class="empty">暂无分配记录（抓取时自动生成）</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- 清洗规则 -->
+        <section v-if="page==='rules'">
+          <div class="page-head">
+            <div><h2>清洗规则库</h2><p>按域名 → 页面指纹 → 通用规则匹配，命中后决定正文容器与需要剔除的区块</p></div>
+            <div class="row" style="gap:8px">
+              <input class="input" style="max-width:220px" v-model="ruleQuery" placeholder="搜索规则名或域名">
+              <button class="btn" @click="loadRules">刷新</button>
+            </div>
+          </div>
+          <div class="panel">
+            <table>
+              <thead><tr><th style="width:180px">规则</th><th style="width:110px">类型</th><th style="width:80px">优先级</th><th>正文选择器</th></tr></thead>
+              <tbody>
+                <tr v-for="r in filteredRules" :key="r.id">
+                  <td>
+                    <div style="font-weight:600">{{ r.name }}</div>
+                    <div class="mono" style="font-size:11.5px;color:var(--muted)">{{ r.id }} · {{ r.domains ? r.domains+' 域名' : '' }}{{ r.gens ? ' · '+r.gens+' 指纹' : '' }}</div>
+                  </td>
+                  <td><span class="badge gray">{{ r.kind }}</span></td>
+                  <td class="mono">{{ r.priority }}</td>
+                  <td class="mono" style="font-size:11.5px;color:var(--muted)">{{ (r.content||[]).join('  ') }}</td>
+                </tr>
+                <tr v-if="!filteredRules.length"><td colspan="4" class="empty">没有匹配的规则</td></tr>
               </tbody>
             </table>
           </div>
@@ -659,6 +708,36 @@ tbody tr:last-child td{border-bottom:none}
     </div>
   </div>
 
+  <!-- 添加节点弹窗 -->
+  <div class="modal-mask" v-if="showNodeModal" @click.self="closeNodeModal">
+    <div class="modal" style="width:560px">
+      <h3>添加节点</h3>
+      <p>节点创建后处于「待加入」状态，请在目标机器执行下方命令完成密钥领取。</p>
+      <template v-if="!joinCmd">
+        <div class="row">
+          <div class="field" style="flex:1"><label>节点 ID</label><input class="input" v-model="nodeForm.node_id" placeholder="留空自动生成，如 node-2"></div>
+          <div class="field" style="flex:1"><label>名称</label><input class="input" v-model="nodeForm.name" placeholder="如：华东-1"></div>
+        </div>
+        <div class="row">
+          <div class="field" style="flex:1"><label>对外地址</label><input class="input" v-model="nodeForm.addr" placeholder="http://10.0.0.2:8081"></div>
+          <div class="field" style="width:120px"><label>权重</label><input class="input" type="number" v-model.number="nodeForm.weight"></div>
+        </div>
+        <div class="row" style="justify-content:flex-end;margin-top:8px">
+          <button class="btn" @click="closeNodeModal">取消</button>
+          <button class="btn primary" @click="createNode">创建并生成命令</button>
+        </div>
+      </template>
+      <template v-else>
+        <div class="keybox" style="white-space:pre-wrap;font-size:12px;line-height:1.6">{{ joinCmd }}</div>
+        <p style="margin:12px 0 0">命令含一次性令牌，24 小时内有效；节点首次启动后自动领取密钥并写入 data/node_identity.json。</p>
+        <div class="row" style="justify-content:flex-end">
+          <button class="btn" @click="copyCmd">复制</button>
+          <button class="btn primary" @click="closeNodeModal">完成</button>
+        </div>
+      </template>
+    </div>
+  </div>
+
   <!-- 创建密钥弹窗 -->
   <div class="modal-mask" v-if="showKeyModal" @click.self="closeKeyModal">
     <div class="modal">
@@ -722,7 +801,8 @@ const menu = [
   ]},
   { title:'抓取', items:[
     {key:'crawl',label:'任务控制',icon:'crawl'},
-    {key:'crawlLogs',label:'抓取日志',icon:'list'}
+    {key:'crawlLogs',label:'抓取日志',icon:'list'},
+    {key:'rules',label:'清洗规则',icon:'list'}
   ]},
   { title:'集群', items:[
     {key:'nodes',label:'节点',icon:'server'},
@@ -739,7 +819,7 @@ const menu = [
 ];
 
 const crumbMap = {overview:'概览 / 系统概览',docs:'数据管理 / 文档库',seeds:'数据管理 / 种子站点',hot:'数据管理 / 热门查询',
-  crawl:'抓取 / 任务控制',crawlLogs:'抓取 / 抓取日志',nodes:'集群 / 节点',assign:'集群 / 域名分配',
+  crawl:'抓取 / 任务控制',crawlLogs:'抓取 / 抓取日志',rules:'抓取 / 清洗规则',nodes:'集群 / 节点',assign:'集群 / 域名分配',
   search:'检索 / 搜索测试',queryLogs:'检索 / 查询日志',config:'系统 / 系统配置',keys:'系统 / API 密钥'};
 
 createApp({
@@ -761,6 +841,12 @@ createApp({
     const crawl = ref({stats:{}, queue:{}});
     const logs = ref([]);
     const nodes = ref([]);
+    const nodeMeta = ref({replica_factor:1, require_auth:true, self_id:'', join_bases:[]});
+    const showNodeModal = ref(false);
+    const joinCmd = ref('');
+    const nodeForm = reactive({node_id:'', name:'', addr:'', weight:1});
+    const rules = ref([]);
+    const ruleQuery = ref('');
     const assignments = ref([]);
     const searchQuery = ref('');
     const searchRes = ref(null);
@@ -836,6 +922,7 @@ createApp({
         else if(k==='crawlLogs') await loadLogs();
         else if(k==='nodes') await loadNodes();
         else if(k==='assign') await loadAssign();
+        else if(k==='rules') await loadRules();
         else if(k==='queryLogs') await loadQLogs();
         else if(k==='config') config.value = await api('/admin/config');
         else if(k==='keys') keys.value = (await api('/admin/keys')).keys || [];
@@ -848,7 +935,50 @@ createApp({
       catch(e){ toast(e.message,'err'); }
     }
     async function loadLogs(){ try{ logs.value = (await api('/admin/crawl/logs')).logs || []; }catch(e){ toast(e.message,'err'); } }
-    async function loadNodes(){ try{ nodes.value = (await api('/admin/nodes')).nodes || []; }catch(e){ toast(e.message,'err'); } }
+    async function loadNodes(){
+      try{
+        const d = await api('/admin/nodes');
+        nodes.value = d.nodes || [];
+        nodeMeta.value = {replica_factor:d.replica_factor, require_auth:d.require_auth,
+          self_id:d.self_id, join_bases:d.join_bases||[]};
+      }catch(e){ toast(e.message,'err'); }
+    }
+    async function loadRules(){ try{ rules.value = (await api('/admin/rules')).rules || []; }catch(e){ toast(e.message,'err'); } }
+    const filteredRules = computed(()=>{
+      const q = ruleQuery.value.trim().toLowerCase();
+      if(!q) return rules.value;
+      return rules.value.filter(r=> (r.id+' '+r.name+' '+(r.content||[]).join(' ')).toLowerCase().includes(q));
+    });
+    function openNodeModal(){ nodeForm.node_id=''; nodeForm.name=''; nodeForm.addr=''; nodeForm.weight=1; joinCmd.value=''; showNodeModal.value=true; }
+    function closeNodeModal(){ showNodeModal.value=false; joinCmd.value=''; }
+    async function createNode(){
+      try{
+        const r = await api('/admin/nodes/create',{method:'POST',body:JSON.stringify(nodeForm)});
+        joinCmd.value = r.command; toast('节点已创建，等待加入'); await loadNodes();
+      }catch(e){ toast(e.message,'err'); }
+    }
+    async function resetNode(n){
+      if(!confirm('重置「'+(n.name||n.node_id)+'」的密钥？该节点需用新命令重新加入。')) return;
+      try{
+        const r = await api('/admin/nodes/reset',{method:'POST',body:JSON.stringify({node_id:n.node_id})});
+        joinCmd.value = r.command; showNodeModal.value=true; await loadNodes();
+      }catch(e){ toast(e.message,'err'); }
+    }
+    async function delNode(n){
+      if(!confirm('确认删除节点「'+(n.name||n.node_id)+'」？其负责的域名会重新分配。')) return;
+      try{ await api('/admin/nodes/delete',{method:'POST',body:JSON.stringify({node_id:n.node_id})});
+        toast('已删除'); await loadNodes();
+      }catch(e){ toast(e.message,'err'); }
+    }
+    async function setNodeWeight(n){
+      const v = prompt('节点权重（影响多节点结果合并时的占比）', n.weight);
+      if(v===null) return;
+      const w = Number(v); if(!w || w<=0){ toast('权重需大于 0','err'); return; }
+      try{ await api('/admin/nodes/weight',{method:'POST',body:JSON.stringify({node_id:n.node_id, weight:w})});
+        toast('已更新'); await loadNodes();
+      }catch(e){ toast(e.message,'err'); }
+    }
+    function copyCmd(){ navigator.clipboard && navigator.clipboard.writeText(joinCmd.value); toast('命令已复制'); }
     async function loadAssign(){ try{ assignments.value = (await api('/admin/assignments')).assignments || []; }catch(e){ toast(e.message,'err'); } }
     async function loadQLogs(){ try{ qLogs.value = (await api('/admin/query-logs')).logs || []; }catch(e){ toast(e.message,'err'); } }
 
@@ -925,9 +1055,11 @@ createApp({
       overview, docsData, docQuery, seeds, hot, crawl, logs, nodes, assignments,
       searchQuery, searchRes, searching, qLogs, config, keys, enqueueText, hdrKey, hdrVal,
       toasts, showKeyModal, createdKey, newKey, newSeed,
+      nodeMeta, showNodeModal, joinCmd, nodeForm, rules, ruleQuery, filteredRules,
       ICONS, menu, crumb, queuePct,
       doLogin, logout, go, refreshAll, loadDocs, loadLogs, loadNodes, loadAssign, loadQLogs,
       startCrawl, stopCrawl, doEnqueue, createSeed, doSearch, saveConfig, addHeader,
+      loadRules, openNodeModal, closeNodeModal, createNode, resetNode, delNode, setNodeWeight, copyCmd,
       createKey, toggleKey, delKey, closeKeyModal, copyKey, fmt, fmtTime };
   }
 }).mount('#app');

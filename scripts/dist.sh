@@ -10,6 +10,10 @@ cd "$ROOT"
 NAME="queryza-${VERSION}-linux-${ARCH}"
 OUT="dist/${NAME}"
 
+# 用目标版本重新编译，避免复用带旧版本号的二进制
+make -s algo >/dev/null
+GOTOOLCHAIN=local go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o bin/queryza ./cmd/queryza
+
 rm -rf "$OUT"
 mkdir -p "$OUT/configs" "$OUT/seeds"
 

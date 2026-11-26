@@ -48,11 +48,23 @@ type Node struct {
 	LastHeartbeat time.Time `json:"last_heartbeat"`
 	IsSelf        bool      `json:"is_self"`
 	Config        string    `json:"config"`
+	Secret        string    `json:"-"`
+	Enabled       bool      `json:"enabled"`
+	Version       string    `json:"version"`
+	LastIP        string    `json:"last_ip"`
+}
+
+type DomainReplica struct {
+	Domain string  `json:"domain"`
+	NodeID string  `json:"node_id"`
+	Role   string  `json:"role"`
+	Weight float64 `json:"weight"`
 }
 
 type DomainAssignment struct {
 	Domain string  `json:"domain"`
 	NodeID string  `json:"node_id"`
+	Role   string  `json:"role"`
 	Weight float64 `json:"weight"`
 }
 
@@ -93,6 +105,7 @@ type CrawlLog struct {
 	Error      string    `json:"error"`
 	DurationMS int       `json:"duration_ms"`
 	NodeID     string    `json:"node_id"`
+	RuleID     string    `json:"rule_id"`
 	CreatedAt  time.Time `json:"created_at"`
 }
 
