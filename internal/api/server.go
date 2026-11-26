@@ -58,11 +58,20 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/internal/enroll", s.handleEnroll)
+	mux.HandleFunc("/internal/crawl", s.handleInternalCrawl)
 	mux.HandleFunc("/internal/register", s.handleRegister)
 	mux.HandleFunc("/internal/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("/internal/search", s.handleInternalSearch)
 	mux.HandleFunc("/internal/assign", s.handleAssign)
 	mux.HandleFunc("/internal/ping", s.handlePing)
+
+	// 子节点只提供内部接口：不带管理界面，也不对外暴露检索 API
+	if s.cfg.Cluster.Role == "node" {
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			writeErr(w, http.StatusNotFound, "node 仅提供内部接口")
+		})
+		return s.withCommon(mux)
+	}
 
 	mux.HandleFunc("/api/v1/", s.routeAPI)
 
@@ -159,6 +168,34 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, cluster.EnrollResp{
 		OK: true, NodeID: nodeID, Secret: secret, MasterID: s.cfg.Cluster.NodeID,
 	})
+}
+
+// handleInternalCrawl 由主节点下发抓取开关。
+func (s *Server) handleInternalCrawl(w http.ResponseWriter, r *http.Request) {
+	_, body, ok := s.requireInternal(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, 400, "bad request")
+		return
+	}
+	switch req.Action {
+	case "start":
+		if err := s.startCrawl(r.Context()); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	case "stop":
+		s.stopCrawl()
+	default:
+		writeErr(w, 400, "未知动作")
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "running": s.crawlRunning()})
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {

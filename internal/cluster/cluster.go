@@ -738,6 +738,35 @@ func (m *Master) Search(ctx context.Context, query string, topK int) (*search.Re
 	return res, nil
 }
 
+// BroadcastCrawl 把抓取开关下发给所有在线节点。
+func (m *Master) BroadcastCrawl(ctx context.Context, action string) []string {
+	var failed []string
+	for _, n := range m.OnlineNodes() {
+		if n.NodeID == m.cfg.Cluster.NodeID || n.Addr == "" {
+			continue
+		}
+		body, _ := json.Marshal(map[string]string{"action": action})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(n.Addr, "/internal/crawl"), bytes.NewReader(body))
+		if err != nil {
+			failed = append(failed, n.NodeID)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		SignRequest(req, m.cfg.Cluster.Secret, m.cfg.Cluster.NodeID, body)
+		resp, err := m.client.Do(req)
+		if err != nil {
+			failed = append(failed, n.NodeID+": "+err.Error())
+			continue
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			failed = append(failed, n.NodeID+fmt.Sprintf(": %d", resp.StatusCode))
+		}
+	}
+	return failed
+}
+
 // replicaSearch 在副本节点上代查故障节点负责的域名。
 func (m *Master) replicaSearch(ctx context.Context, failedNode, query string, topK int) (*search.Result, store.Node, error) {
 	domains := m.DomainsOf(failedNode)

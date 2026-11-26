@@ -273,12 +273,15 @@ func (s *Server) aCrawlStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "running": true})
+	// 节点不带界面，抓取由主节点统一下发
+	failed := s.master.BroadcastCrawl(r.Context(), "start")
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "running": true, "failed_nodes": failed})
 }
 
 func (s *Server) aCrawlStop(w http.ResponseWriter, r *http.Request) {
 	s.stopCrawl()
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "running": false})
+	failed := s.master.BroadcastCrawl(r.Context(), "stop")
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "running": false, "failed_nodes": failed})
 }
 
 func (s *Server) aCrawlEnqueue(w http.ResponseWriter, r *http.Request) {
