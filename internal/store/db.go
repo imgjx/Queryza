@@ -162,6 +162,7 @@ var schema = []string{
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 		UNIQUE KEY uk_url_hash (url_hash),
 		KEY idx_status_prio (status, priority),
+		KEY idx_status_domain (status, domain),
 		KEY idx_domain (domain)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
@@ -205,6 +206,10 @@ func (d *DB) Migrate() error {
 			return fmt.Errorf("建表失败: %w", err)
 		}
 	}
+	// 增量索引：按域名轮转领取任务需要 (status,domain) 索引
+	d.ensureIndex("crawl_queue", "idx_status_domain", "KEY idx_status_domain (status, domain)")
+	d.ensureIndex("documents", "idx_content_hash", "KEY idx_content_hash (content_hash)")
+
 	// 增量列：老库升级时补齐
 	for _, c := range []struct{ table, col, ddl string }{
 		{"nodes", "secret", "secret VARCHAR(64) NOT NULL DEFAULT ''"},
@@ -215,10 +220,37 @@ func (d *DB) Migrate() error {
 	} {
 		d.ensureColumn(c.table, c.col, c.ddl)
 	}
+	// 倒排表主键改造：以 (term,doc_id) 聚簇，去掉自增 id 与冗余唯一索引。
+	// 写入变成按词项顺序追加，表也更小；只需迁移一次。
+	d.migratePostingsPK()
+
 	// 旧版单副本分配表迁移到多副本表（幂等）
 	d.Exec(`INSERT IGNORE INTO domain_replicas(domain,node_id,role,weight)
 		SELECT domain,node_id,'primary',weight FROM domain_assignments`)
 	return nil
+}
+
+func (d *DB) migratePostingsPK() {
+	var n int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='postings' AND COLUMN_NAME='id'`).Scan(&n); err != nil {
+		return
+	}
+	if n == 0 {
+		return
+	}
+	d.Exec(`ALTER TABLE postings DROP PRIMARY KEY, DROP KEY uk_term_doc, DROP COLUMN id, ADD PRIMARY KEY(term,doc_id)`)
+}
+
+func (d *DB) ensureIndex(table, name, ddl string) {
+	var n int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?`, table, name).Scan(&n); err != nil {
+		return
+	}
+	if n == 0 {
+		d.Exec("ALTER TABLE " + table + " ADD " + ddl)
+	}
 }
 
 func (d *DB) ensureColumn(table, col, ddl string) {

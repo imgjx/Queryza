@@ -65,20 +65,31 @@ type Master struct {
 	mu    sync.RWMutex
 	nodes map[string]*store.Node
 
-	asgMu sync.Mutex
+	// asgMu 保护域名主副本缓存：抓取热路径上每条 URL 都要判定归属，
+	// 必须走内存，不能每次查库（曾是最严重的串行点）。
+	asgMu    sync.RWMutex
+	asgCache map[string]*asgEntry
+	assignMu sync.Mutex
 
 	domMu   sync.Mutex
 	domains map[string][]string // nodeID -> 主副本域名
 	domAt   time.Time
 }
 
+type asgEntry struct {
+	primary string
+	at      time.Time
+	ttl     time.Duration
+}
+
 func NewMaster(cfg *config.Config, db *store.DB, local *search.Searcher) *Master {
 	m := &Master{
-		cfg:    cfg,
-		db:     db,
-		local:  local,
-		client: &http.Client{Timeout: 15 * time.Second},
-		nodes:  map[string]*store.Node{},
+		cfg:      cfg,
+		db:       db,
+		local:    local,
+		client:   &http.Client{Timeout: 15 * time.Second},
+		nodes:    map[string]*store.Node{},
+		asgCache: map[string]*asgEntry{},
 	}
 	m.loadNodes()
 	m.ensureSelf()
@@ -131,6 +142,9 @@ func (m *Master) ensureSelf() {
 		existing = secret
 	}
 	m.cfg.Cluster.Secret = existing
+	// 历史记录里可能残留旧节点的 is_self=1，会让它绕过心跳检查被当成永远在线，
+	// 进而把域名分给一个已经下线的节点（抓取任务永远 pending）
+	m.db.Exec(`UPDATE nodes SET is_self=0 WHERE node_id<>? AND is_self=1`, id)
 	m.loadNodes()
 }
 
@@ -331,13 +345,55 @@ func (m *Master) assignmentCounts() map[string]int {
 }
 
 // AssignDomain 返回域名的主副本节点，不存在则按「已分配域名最少优先」新建副本组。
+// 结果走内存缓存（正缓存 120s / 负缓存 5s）：抓取时每条 URL 都要判定归属，
+// 之前每页一次 DB 查询并持有全局锁，是整条抓取链路的串行瓶颈。
 func (m *Master) AssignDomain(domain string) string {
 	if domain == "" {
 		return ""
 	}
-	m.asgMu.Lock()
-	defer m.asgMu.Unlock()
+	m.asgMu.RLock()
+	e := m.asgCache[domain]
+	m.asgMu.RUnlock()
+	if e != nil && time.Since(e.at) < e.ttl {
+		return e.primary
+	}
 
+	m.assignMu.Lock()
+	// 双重检查：并发 miss 时只放一个 goroutine 去查库/分配
+	m.asgMu.RLock()
+	e = m.asgCache[domain]
+	m.asgMu.RUnlock()
+	if e != nil && time.Since(e.at) < e.ttl {
+		m.assignMu.Unlock()
+		return e.primary
+	}
+	primary, created := m.lookupOrAssign(domain)
+	m.assignMu.Unlock()
+
+	ttl := 120 * time.Second
+	if primary == "" {
+		ttl = 5 * time.Second // 暂无在线节点，短暂负缓存，等节点上线
+	}
+	m.asgMu.Lock()
+	if len(m.asgCache) > 200000 {
+		now := time.Now()
+		for k, v := range m.asgCache {
+			if now.Sub(v.at) >= v.ttl {
+				delete(m.asgCache, k)
+			}
+		}
+	}
+	m.asgCache[domain] = &asgEntry{primary: primary, at: time.Now(), ttl: ttl}
+	m.asgMu.Unlock()
+
+	if created {
+		m.invalidateDomains()
+	}
+	return primary
+}
+
+// lookupOrAssign 查库或新建副本组；调用方需持有 assignMu。
+func (m *Master) lookupOrAssign(domain string) (string, bool) {
 	var primary string
 	rows, err := m.db.Query(`SELECT node_id,role FROM domain_replicas WHERE domain=?`, domain)
 	if err == nil {
@@ -350,12 +406,12 @@ func (m *Master) AssignDomain(domain string) string {
 		rows.Close()
 	}
 	if primary != "" {
-		return primary
+		return primary, false
 	}
 
 	nodes := m.OnlineNodes()
 	if len(nodes) == 0 {
-		return ""
+		return "", false
 	}
 	counts := m.assignmentCounts()
 	sort.SliceStable(nodes, func(i, j int) bool {
@@ -378,8 +434,7 @@ func (m *Master) AssignDomain(domain string) string {
 	for i := 1; i < factor; i++ {
 		m.db.Exec(`INSERT IGNORE INTO domain_replicas(domain,node_id,role,weight) VALUES(?,?,'replica',1)`, domain, nodes[i].NodeID)
 	}
-	m.invalidateDomains()
-	return primary
+	return primary, true
 }
 
 // OwnDomain 判断本节点是否为该域名的主副本（抓取与入库由主副本负责）。
@@ -398,6 +453,10 @@ func (m *Master) invalidateDomains() {
 	m.domMu.Lock()
 	m.domAt = time.Time{}
 	m.domMu.Unlock()
+	// 副本组变化（提主/再均衡/删节点）后，归属缓存必须同步失效
+	m.asgMu.Lock()
+	m.asgCache = map[string]*asgEntry{}
+	m.asgMu.Unlock()
 }
 
 // DomainsOf 返回节点负责的主副本域名（5 秒缓存）。

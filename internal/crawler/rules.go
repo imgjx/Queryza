@@ -167,12 +167,7 @@ func init() {
 // PickRule 按域名 → CMS 指纹 → 通用规则 的顺序选规则。
 // host 不区分大小写，可带端口；lowerHTML 为页面 HTML 的小写副本。
 func PickRule(host, lowerHTML string) *SiteRule {
-	host = strings.ToLower(host)
-	if i := strings.LastIndexByte(host, ':'); i > 0 && !strings.Contains(host[i:], "]") {
-		host = host[:i]
-	}
-	host = strings.TrimPrefix(host, "www.")
-
+	host = normalizeHost(host)
 	if r := matchDomain(host); r != nil {
 		return r
 	}
@@ -180,6 +175,15 @@ func PickRule(host, lowerHTML string) *SiteRule {
 		return r
 	}
 	return genericRule
+}
+
+// normalizeHost 统一主机名：小写、去端口、去 www 前缀
+func normalizeHost(host string) string {
+	host = strings.ToLower(host)
+	if i := strings.LastIndexByte(host, ':'); i > 0 && !strings.Contains(host[i:], "]") {
+		host = host[:i]
+	}
+	return strings.TrimPrefix(host, "www.")
 }
 
 func matchDomain(host string) *SiteRule {

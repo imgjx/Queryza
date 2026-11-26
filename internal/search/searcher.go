@@ -23,11 +23,15 @@ type Searcher struct {
 	cfg      config.SearchConfig
 	embedder *index.Embedder
 	nodeID   string
+	mem      *index.MemIndex
 }
 
 func New(db *store.DB, cache *store.Cache, cfg config.SearchConfig, embedder *index.Embedder, nodeID string) *Searcher {
 	return &Searcher{db: db, cache: cache, cfg: cfg, embedder: embedder, nodeID: nodeID}
 }
+
+// SetMemIndex 挂载内存倒排索引；就绪后检索走内存，否则回落 SQL。
+func (s *Searcher) SetMemIndex(m *index.MemIndex) { s.mem = m }
 
 type Result struct {
 	Query  string            `json:"query"`
@@ -80,6 +84,11 @@ func (s *Searcher) search(ctx context.Context, query string, topK int, allow map
 	tokens := algo.Tokenize(query)
 	if len(tokens) == 0 {
 		tokens = []string{strings.ToLower(query)}
+	}
+
+	// 内存索引就绪时走内存检索（毫秒级），否则回落 SQL
+	if s.mem != nil && s.mem.Ready() {
+		return s.searchMem(ctx, query, tokens, topK, allow, ck, start)
 	}
 
 	var N int

@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"bytes"
 	"net/url"
 	"regexp"
 	"strings"
@@ -42,12 +43,20 @@ var blockTags = map[string]bool{
 
 func Parse(rawURL string, body []byte) *Page {
 	p := &Page{}
-	doc, err := html.Parse(strings.NewReader(string(body)))
+	doc, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
 		return p
 	}
 
-	rule := PickRule(hostOf(rawURL), lowerHTML(body))
+	// 域名规则命中时无需再对整页做小写化 + 指纹扫描（150KB 页面约省 0.8ms）
+	host := hostOf(rawURL)
+	rule := matchDomain(normalizeHost(host))
+	if rule == nil {
+		rule = matchGen(lowerHTML(body))
+	}
+	if rule == nil {
+		rule = genericRule
+	}
 	ex := newExtractor(rule)
 	ex.prepare(doc)
 	p.Rule = rule.ID

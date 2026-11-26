@@ -121,17 +121,26 @@ type LimitsConfig struct {
 	MaxRedisDocs     int `yaml:"max_redis_docs"`
 	MaxRedisHot      int `yaml:"max_redis_hot"`
 	CrawlQueueMax    int `yaml:"crawl_queue_max"`
+	// MaxMemDocs 内存倒排索引的文档上限；超过则检索回落 SQL
+	MaxMemDocs int `yaml:"max_mem_docs"`
 }
 
 // NodeOverride 节点级覆盖：只写需要覆盖的字段。
+// 这些字段可以在管理后台「节点管理」里逐个节点单独设置，落库后热生效。
 type NodeOverride struct {
-	Weight         *float64          `yaml:"weight"`
-	CrawlerEnabled *bool             `yaml:"crawler_enabled"`
-	ProxyGroup     *string           `yaml:"proxy_group"`
-	Headers        map[string]string `yaml:"headers"`
-	MaxDBDocs      *int              `yaml:"max_db_docs"`
-	MaxRedisDocs   *int              `yaml:"max_redis_docs"`
-	Mode           *string           `yaml:"mode"`
+	Weight         *float64          `yaml:"weight" json:"weight,omitempty"`
+	CrawlerEnabled *bool             `yaml:"crawler_enabled" json:"crawler_enabled,omitempty"`
+	ProxyGroup     *string           `yaml:"proxy_group" json:"proxy_group,omitempty"`
+	Headers        map[string]string `yaml:"headers" json:"headers,omitempty"`
+	MaxDBDocs      *int              `yaml:"max_db_docs" json:"max_db_docs,omitempty"`
+	MaxRedisDocs   *int              `yaml:"max_redis_docs" json:"max_redis_docs,omitempty"`
+	Mode           *string           `yaml:"mode" json:"mode,omitempty"`
+	// Concurrency 本节点抓取并发（线程数）；0 表示继承全局
+	Concurrency *int `yaml:"concurrency" json:"concurrency,omitempty"`
+	// PerDomainIntervalMS 本节点同域请求最小间隔（毫秒）
+	PerDomainIntervalMS *int `yaml:"per_domain_interval_ms" json:"per_domain_interval_ms,omitempty"`
+	// MaxPagesPerRun 本节点单次运行抓取上限
+	MaxPagesPerRun *int `yaml:"max_pages_per_run" json:"max_pages_per_run,omitempty"`
 }
 
 func defaults() *Config {
@@ -161,7 +170,7 @@ func defaults() *Config {
 			Hybrid: true, RerankTopN: 100, SnippetLen: 160,
 		},
 		Embedding: EmbeddingConfig{Enabled: false, BaseURL: "https://api.openai.com/v1", Model: "text-embedding-3-small", Dim: 1536, Timeout: 20},
-		Limits:    LimitsConfig{MaxDBDocsPerNode: 1000000, MaxRedisDocs: 20000, MaxRedisHot: 200, CrawlQueueMax: 500000},
+		Limits:    LimitsConfig{MaxDBDocsPerNode: 1000000, MaxRedisDocs: 20000, MaxRedisHot: 200, CrawlQueueMax: 500000, MaxMemDocs: 200000},
 		Nodes:     map[string]NodeOverride{},
 	}
 }
@@ -222,6 +231,11 @@ func (c *Config) ApplyNodeOverride(nodeID string) {
 	if !ok {
 		return
 	}
+	c.ApplyValues(o)
+}
+
+// ApplyValues 应用一份节点级覆盖（YAML 或后台下发的都走这里）。
+func (c *Config) ApplyValues(o NodeOverride) {
 	if o.Weight != nil {
 		c.Cluster.Weight = *o.Weight
 	}
@@ -240,6 +254,15 @@ func (c *Config) ApplyNodeOverride(nodeID string) {
 	if o.MaxRedisDocs != nil {
 		c.Limits.MaxRedisDocs = *o.MaxRedisDocs
 	}
+	if o.Concurrency != nil && *o.Concurrency > 0 {
+		c.Crawler.Concurrency = *o.Concurrency
+	}
+	if o.PerDomainIntervalMS != nil && *o.PerDomainIntervalMS >= 0 {
+		c.Crawler.PerDomainIntervalMS = *o.PerDomainIntervalMS
+	}
+	if o.MaxPagesPerRun != nil && *o.MaxPagesPerRun >= 0 {
+		c.Crawler.MaxPagesPerRun = *o.MaxPagesPerRun
+	}
 	if len(o.Headers) > 0 {
 		if c.Crawler.DefaultHeaders == nil {
 			c.Crawler.DefaultHeaders = map[string]string{}
@@ -253,16 +276,19 @@ func (c *Config) ApplyNodeOverride(nodeID string) {
 // SelfConfig 返回节点自身覆盖后的快照（供 API 展示）。
 func (c *Config) SelfConfig() map[string]interface{} {
 	return map[string]interface{}{
-		"role":           c.Cluster.Role,
-		"node_id":        c.Cluster.NodeID,
-		"node_name":      c.Cluster.NodeName,
-		"weight":         c.Cluster.Weight,
-		"crawler_mode":   c.Crawler.Mode,
-		"crawler_on":     c.Crawler.Enabled,
-		"proxy_group":    c.Crawler.ProxyGroup,
-		"headers":        c.Crawler.DefaultHeaders,
-		"max_db_docs":    c.Limits.MaxDBDocsPerNode,
-		"max_redis_docs": c.Limits.MaxRedisDocs,
+		"role":                   c.Cluster.Role,
+		"node_id":                c.Cluster.NodeID,
+		"node_name":              c.Cluster.NodeName,
+		"weight":                 c.Cluster.Weight,
+		"crawler_mode":           c.Crawler.Mode,
+		"crawler_on":             c.Crawler.Enabled,
+		"concurrency":            c.Crawler.Concurrency,
+		"per_domain_interval_ms": c.Crawler.PerDomainIntervalMS,
+		"max_pages_per_run":      c.Crawler.MaxPagesPerRun,
+		"proxy_group":            c.Crawler.ProxyGroup,
+		"headers":                c.Crawler.DefaultHeaders,
+		"max_db_docs":            c.Limits.MaxDBDocsPerNode,
+		"max_redis_docs":         c.Limits.MaxRedisDocs,
 	}
 }
 

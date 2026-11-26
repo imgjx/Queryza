@@ -9,31 +9,65 @@ package algo
 import "C"
 
 import (
-	"encoding/json"
 	"math"
 	"unsafe"
 )
 
 // Tokenize 调用 C++ 分词器，返回词项列表。
+// 走紧凑格式（'\0' 分隔的连续缓冲），不经过 JSON，长文分词快数倍。
 func Tokenize(text string) []string {
 	if text == "" {
 		return nil
 	}
 	cs := C.CString(text)
 	defer C.free(unsafe.Pointer(cs))
-	p := C.qz_tokenize(cs)
-	defer C.qz_free(unsafe.Pointer(p))
-	js := C.GoString(p)
-	var out []string
-	if err := json.Unmarshal([]byte(js), &out); err != nil {
+	var cnt, size C.int
+	p := C.qz_tokenize_flat(cs, &cnt, &size)
+	if p == nil {
 		return nil
+	}
+	defer C.qz_free(unsafe.Pointer(p))
+	if cnt <= 0 || size <= 0 {
+		return nil
+	}
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(p)), int(size))
+	out := make([]string, 0, int(cnt))
+	start := 0
+	for i := 0; i < len(buf); i++ {
+		if buf[i] == 0 {
+			if i > start {
+				out = append(out, string(buf[start:i]))
+			}
+			start = i + 1
+		}
+	}
+	if start < len(buf) {
+		out = append(out, string(buf[start:]))
 	}
 	return out
 }
 
-// BM25 单文档得分。
+// BM25 单文档得分。纯 Go 实现：搜索时每个候选行都要算一次，
+// 走 cgo 的调用开销比算术本身还大。
 func BM25(tf, df, docLen int, avgdl float64, N int, k1, b float64) float64 {
-	return float64(C.qz_bm25(C.int(tf), C.int(df), C.int(docLen), C.double(avgdl), C.int(N), C.double(k1), C.double(b)))
+	if tf <= 0 || N <= 0 || docLen <= 0 {
+		return 0
+	}
+	if df <= 0 {
+		df = 1
+	}
+	if df > N {
+		df = N
+	}
+	idf := math.Log(1.0 + (float64(N-df)+0.5)/(float64(df)+0.5))
+	if avgdl <= 0 {
+		avgdl = 1
+	}
+	denom := float64(tf) + k1*(1.0-b+b*(float64(docLen)/avgdl))
+	if denom <= 0 {
+		return 0
+	}
+	return idf * (float64(tf) * (k1 + 1.0)) / denom
 }
 
 // CosineBatch 计算 query 与多个文档向量的余弦相似度。
@@ -58,7 +92,13 @@ func CosineBatch(q []float32, docs [][]float32, dim int) []float64 {
 
 // RRF 融合分。
 func RRF(rank int, k float64) float64 {
-	return float64(C.qz_rrf(C.int(rank), C.double(k)))
+	if rank <= 0 {
+		return 0
+	}
+	if k <= 0 {
+		k = 60
+	}
+	return 1.0 / (k + float64(rank))
 }
 
 // Normalize 将分数集合做 min-max 归一化（用于混合排序融合）。

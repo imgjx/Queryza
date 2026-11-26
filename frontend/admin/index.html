@@ -489,9 +489,11 @@ tbody tr:last-child td{border-bottom:none}
               <div class="node-metrics">
                 <div><b>{{ fmt(n.doc_count) }}</b>文档</div>
                 <div><b>{{ n.weight }}</b>权重</div>
+                <div><b>{{ nodeCfg(n).concurrency || '—' }}</b>并发线程</div>
                 <div><b class="mono" style="font-size:12px">{{ n.last_ip || '—' }}</b>来源 IP</div>
               </div>
               <div class="row" style="margin-top:14px;gap:8px">
+                <button class="btn sm" @click="openNodeCfg(n)">独立配置</button>
                 <button class="btn sm" @click="setNodeWeight(n)">权重</button>
                 <button class="btn sm" @click="resetNode(n)" :disabled="n.is_self">重置密钥</button>
                 <button class="btn sm danger" @click="delNode(n)" :disabled="n.is_self">删除</button>
@@ -708,6 +710,46 @@ tbody tr:last-child td{border-bottom:none}
     </div>
   </div>
 
+  <!-- 节点独立配置弹窗 -->
+  <div class="modal-mask" v-if="showNodeCfg" @click.self="showNodeCfg=false">
+    <div class="modal" style="width:620px">
+      <h3>节点独立配置 · {{ nodeCfgForm.node_id }}</h3>
+      <p>并发线程、同域间隔、单次上限保存后立即生效；模式 / 代理组 / 请求头在该节点下一轮轮询（约 20 秒）后生效。</p>
+      <div class="row">
+        <div class="field" style="flex:1"><label>抓取并发（线程数）</label>
+          <input class="input" type="number" min="1" max="512" v-model.number="nodeCfgForm.concurrency" placeholder="继承全局 {{ nodeCfgDefaults.concurrency }}"></div>
+        <div class="field" style="flex:1"><label>同域请求间隔（毫秒）</label>
+          <input class="input" type="number" min="0" v-model.number="nodeCfgForm.per_domain_interval_ms" placeholder="继承全局 {{ nodeCfgDefaults.per_domain_interval_ms }}"></div>
+        <div class="field" style="flex:1"><label>单次抓取上限</label>
+          <input class="input" type="number" min="0" v-model.number="nodeCfgForm.max_pages_per_run" placeholder="继承全局 {{ nodeCfgDefaults.max_pages_per_run }}"></div>
+      </div>
+      <div class="row">
+        <div class="field" style="flex:1"><label>最大 DB 文档数</label>
+          <input class="input" type="number" min="0" v-model.number="nodeCfgForm.max_db_docs" placeholder="继承全局 {{ nodeCfgDefaults.max_db_docs }}"></div>
+        <div class="field" style="flex:1"><label>最大 Redis 文档数</label>
+          <input class="input" type="number" min="0" v-model.number="nodeCfgForm.max_redis_docs" placeholder="继承全局 {{ nodeCfgDefaults.max_redis_docs }}"></div>
+        <div class="field" style="width:150px"><label>权重</label>
+          <input class="input" type="number" step="0.1" min="0.1" v-model.number="nodeCfgForm.weight" placeholder="继承全局"></div>
+      </div>
+      <div class="row">
+        <div class="field" style="flex:1"><label>抓取模式</label>
+          <select class="input" v-model="nodeCfgForm.mode">
+            <option value="">继承全局（{{ nodeCfgDefaults.mode }}）</option>
+            <option value="full">全网爬取 full</option>
+            <option value="targeted">定向爬取 targeted</option>
+          </select></div>
+        <div class="field" style="flex:1"><label>代理 IP 组</label>
+          <input class="input" v-model="nodeCfgForm.proxy_group" placeholder="留空继承全局"></div>
+      </div>
+      <div class="field"><label>自定义请求头（JSON，留空继承全局）</label>
+        <textarea class="input" rows="3" v-model="nodeCfgForm.headersText" placeholder='{"User-Agent":"Mozilla/5.0 ..."}' style="font-family:var(--mono);font-size:12px"></textarea></div>
+      <div class="row" style="justify-content:flex-end;margin-top:8px">
+        <button class="btn" @click="showNodeCfg=false">取消</button>
+        <button class="btn primary" @click="saveNodeCfg">保存配置</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 添加节点弹窗 -->
   <div class="modal-mask" v-if="showNodeModal" @click.self="closeNodeModal">
     <div class="modal" style="width:560px">
@@ -845,6 +887,11 @@ createApp({
     const showNodeModal = ref(false);
     const joinCmd = ref('');
     const nodeForm = reactive({node_id:'', name:'', addr:'', weight:1});
+    const showNodeCfg = ref(false);
+    const nodeCfgDefaults = ref({});
+    const nodeCfgForm = reactive({node_id:'', concurrency:null, per_domain_interval_ms:null,
+      max_pages_per_run:null, max_db_docs:null, max_redis_docs:null, weight:null,
+      mode:'', proxy_group:'', headersText:''});
     const rules = ref([]);
     const ruleQuery = ref('');
     const assignments = ref([]);
@@ -970,6 +1017,49 @@ createApp({
         toast('已删除'); await loadNodes();
       }catch(e){ toast(e.message,'err'); }
     }
+    // 节点卡片上展示的自报配置（心跳上报的快照）
+    function nodeCfg(n){
+      if(!n || !n.config) return {};
+      try{ return typeof n.config==='string' ? JSON.parse(n.config) : n.config; }catch(e){ return {}; }
+    }
+    async function openNodeCfg(n){
+      try{
+        const d = await api('/admin/nodes/config?node_id='+encodeURIComponent(n.node_id));
+        const o = d.override || {};
+        nodeCfgDefaults.value = d.defaults || {};
+        nodeCfgForm.node_id = n.node_id;
+        nodeCfgForm.concurrency = o.concurrency ?? null;
+        nodeCfgForm.per_domain_interval_ms = o.per_domain_interval_ms ?? null;
+        nodeCfgForm.max_pages_per_run = o.max_pages_per_run ?? null;
+        nodeCfgForm.max_db_docs = o.max_db_docs ?? null;
+        nodeCfgForm.max_redis_docs = o.max_redis_docs ?? null;
+        nodeCfgForm.weight = o.weight ?? null;
+        nodeCfgForm.mode = o.mode || '';
+        nodeCfgForm.proxy_group = o.proxy_group || '';
+        nodeCfgForm.headersText = o.headers && Object.keys(o.headers).length ? JSON.stringify(o.headers, null, 2) : '';
+        showNodeCfg.value = true;
+      }catch(e){ toast(e.message,'err'); }
+    }
+    async function saveNodeCfg(){
+      const body = {node_id: nodeCfgForm.node_id};
+      const numKeys = ['concurrency','per_domain_interval_ms','max_pages_per_run','max_db_docs','max_redis_docs','weight'];
+      for(const k of numKeys){
+        const v = nodeCfgForm[k];
+        if(v===null || v===undefined || v==='' || isNaN(v)) continue;
+        body[k] = Number(v);
+      }
+      if(nodeCfgForm.mode) body.mode = nodeCfgForm.mode;
+      if(nodeCfgForm.proxy_group) body.proxy_group = nodeCfgForm.proxy_group;
+      if(nodeCfgForm.headersText.trim()){
+        try{ body.headers = JSON.parse(nodeCfgForm.headersText); }
+        catch(e){ toast('请求头不是合法 JSON','err'); return; }
+      }
+      try{
+        const r = await api('/admin/nodes/config',{method:'POST',body:JSON.stringify(body)});
+        toast(r.applied_now ? '已保存并立即生效' : '已保存，节点将在 20 秒内应用');
+        showNodeCfg.value=false; await loadNodes();
+      }catch(e){ toast(e.message,'err'); }
+    }
     async function setNodeWeight(n){
       const v = prompt('节点权重（影响多节点结果合并时的占比）', n.weight);
       if(v===null) return;
@@ -1056,6 +1146,7 @@ createApp({
       searchQuery, searchRes, searching, qLogs, config, keys, enqueueText, hdrKey, hdrVal,
       toasts, showKeyModal, createdKey, newKey, newSeed,
       nodeMeta, showNodeModal, joinCmd, nodeForm, rules, ruleQuery, filteredRules,
+      showNodeCfg, nodeCfgDefaults, nodeCfgForm, nodeCfg, openNodeCfg, saveNodeCfg,
       ICONS, menu, crumb, queuePct,
       doLogin, logout, go, refreshAll, loadDocs, loadLogs, loadNodes, loadAssign, loadQLogs,
       startCrawl, stopCrawl, doEnqueue, createSeed, doSearch, saveConfig, addHeader,

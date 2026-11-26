@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"queryza/internal/store"
@@ -24,6 +26,50 @@ type Frontier struct {
 	nodeID  string
 	max     int
 	domains []string // 本节点负责的域名，非空时只领取这些域名的任务
+	sink    *batchWriter
+
+	// 队列长度缓存：原来每次入队都 COUNT(*) 全表
+	cMu     sync.Mutex
+	cCount  int64
+	cAt     time.Time
+
+	// 新出现的域名：派发前统一做副本分配，避免「未分配 → 不在白名单 → 永不抓取」
+	dMu     sync.Mutex
+	newDoms map[string]struct{}
+
+	// 环形游标：按域名轮转领取，避免同一站点占满批次
+	cursor string
+}
+
+// DrainNewDomains 取出自上次调用以来新入队的域名。
+func (f *Frontier) DrainNewDomains() []string {
+	f.dMu.Lock()
+	defer f.dMu.Unlock()
+	if len(f.newDoms) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(f.newDoms))
+	for d := range f.newDoms {
+		out = append(out, d)
+	}
+	f.newDoms = map[string]struct{}{}
+	return out
+}
+
+func (f *Frontier) noteDomains(tasks []Task) {
+	if len(tasks) == 0 {
+		return
+	}
+	f.dMu.Lock()
+	if f.newDoms == nil {
+		f.newDoms = make(map[string]struct{}, 64)
+	}
+	for _, t := range tasks {
+		if t.Domain != "" {
+			f.newDoms[t.Domain] = struct{}{}
+		}
+	}
+	f.dMu.Unlock()
 }
 
 func NewFrontier(db *store.DB, nodeID string, max int) *Frontier {
@@ -32,6 +78,8 @@ func NewFrontier(db *store.DB, nodeID string, max int) *Frontier {
 	}
 	return &Frontier{db: db, nodeID: nodeID, max: max}
 }
+
+func (f *Frontier) setSink(w *batchWriter) { f.sink = w }
 
 func URLHash(u string) string {
 	h := sha256.Sum256([]byte(u))
@@ -51,53 +99,98 @@ func (f *Frontier) Enqueue(ctx context.Context, tasks []Task) (int, error) {
 	if len(tasks) == 0 {
 		return 0, nil
 	}
-	var cnt int64
-	f.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM crawl_queue`).Scan(&cnt)
-	room := f.max - int(cnt)
+	room := f.max - int(f.queueLen(ctx))
 	if room <= 0 {
 		return 0, nil
 	}
+	if room < len(tasks) {
+		tasks = tasks[:room]
+	}
 	added := 0
-	tx, err := f.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, `INSERT IGNORE INTO crawl_queue
-		(url,url_hash,domain,depth,priority,status,node_id) VALUES(?,?,?,?,?,'pending','')`)
-	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
-	for _, t := range tasks {
-		if added >= room {
-			break
+	// 多值 INSERT，几百个链接一次往返；分批避免 SQL 过长
+	const chunk = 200
+	for start := 0; start < len(tasks); start += chunk {
+		end := start + chunk
+		if end > len(tasks) {
+			end = len(tasks)
 		}
-		if t.URLHash == "" {
-			t.URLHash = URLHash(t.URL)
+		batch := tasks[start:end]
+		var sb strings.Builder
+		sb.Grow(len(batch) * 24)
+		sb.WriteString(`INSERT IGNORE INTO crawl_queue(url,url_hash,domain,depth,priority,status,node_id) VALUES `)
+		args := make([]interface{}, 0, len(batch)*5)
+		for i, t := range batch {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(`(?,?,?,?,?,'pending','')`)
+			if t.URLHash == "" {
+				t.URLHash = URLHash(t.URL)
+			}
+			args = append(args, t.URL, t.URLHash, t.Domain, t.Depth, t.Priority)
 		}
-		r, err := stmt.ExecContext(ctx, t.URL, t.URLHash, t.Domain, t.Depth, t.Priority)
+		r, err := f.db.ExecContext(ctx, sb.String(), args...)
 		if err != nil {
 			continue
 		}
 		if n, _ := r.RowsAffected(); n > 0 {
-			added++
+			added += int(n)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
+	if added > 0 {
+		f.noteDomains(tasks)
+		f.cMu.Lock()
+		f.cCount += int64(added)
+		f.cAt = time.Now()
+		f.cMu.Unlock()
 	}
 	return added, nil
+}
+
+// queueLen 队列长度，30 秒缓存并随入队增量更新。
+func (f *Frontier) queueLen(ctx context.Context) int64 {
+	f.cMu.Lock()
+	if time.Since(f.cAt) < 30*time.Second {
+		n := f.cCount
+		f.cMu.Unlock()
+		return n
+	}
+	f.cMu.Unlock()
+
+	var cnt int64
+	f.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM crawl_queue`).Scan(&cnt)
+	f.cMu.Lock()
+	f.cCount, f.cAt = cnt, time.Now()
+	f.cMu.Unlock()
+	return cnt
 }
 
 // SetDomains 限定本节点可领取的域名；传 nil 表示不限制。
 func (f *Frontier) SetDomains(ds []string) { f.domains = ds }
 
 // Lease 原子领取任务。
+// 按域名排序 + 环形游标领取：同一站点的链接在队列里往往成百上千连在一起，
+// 若按优先级顺序领，会被单个站点占满批次，抓取并发退化成 1-2 个域名。
 func (f *Frontier) Lease(ctx context.Context, n int) ([]Task, error) {
 	if n <= 0 {
 		n = 1
 	}
+	tasks, err := f.leaseFrom(ctx, f.cursor, n)
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) == 0 && f.cursor != "" {
+		// 游标已到队尾，回绕到队首
+		f.cursor = ""
+		return f.leaseFrom(ctx, "", n)
+	}
+	if len(tasks) > 0 {
+		f.cursor = tasks[len(tasks)-1].Domain
+	}
+	return tasks, nil
+}
+
+func (f *Frontier) leaseFrom(ctx context.Context, after string, n int) ([]Task, error) {
 	tx, err := f.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -111,7 +204,11 @@ func (f *Frontier) Lease(ctx context.Context, n int) ([]Task, error) {
 			args = append(args, d)
 		}
 	}
-	q += ` ORDER BY priority DESC, id ASC LIMIT ? FOR UPDATE SKIP LOCKED`
+	if after != "" {
+		q += ` AND domain > ?`
+		args = append(args, after)
+	}
+	q += ` ORDER BY domain ASC, priority DESC, id ASC LIMIT ? FOR UPDATE SKIP LOCKED`
 	args = append(args, n)
 
 	rows, err := tx.QueryContext(ctx, q, args...)
@@ -129,11 +226,22 @@ func (f *Frontier) Lease(ctx context.Context, n int) ([]Task, error) {
 	if len(tasks) == 0 {
 		return nil, nil
 	}
-	stmt, _ := tx.PrepareContext(ctx, `UPDATE crawl_queue SET status='fetching', node_id=?, updated_at=NOW() WHERE id=?`)
-	for _, t := range tasks {
-		stmt.ExecContext(ctx, f.nodeID, t.ID)
+	// 批量改状态，一条 SQL 代替逐行 UPDATE
+	var sb strings.Builder
+	sb.WriteString(`UPDATE crawl_queue SET status='fetching', node_id=?, updated_at=NOW() WHERE id IN (`)
+	uargs := make([]interface{}, 0, len(tasks)+1)
+	uargs = append(uargs, f.nodeID)
+	for i, t := range tasks {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('?')
+		uargs = append(uargs, t.ID)
 	}
-	stmt.Close()
+	sb.WriteByte(')')
+	if _, err := tx.ExecContext(ctx, sb.String(), uargs...); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -142,6 +250,10 @@ func (f *Frontier) Lease(ctx context.Context, n int) ([]Task, error) {
 
 // Release 把任务放回队列（非本节点负责的域名用）
 func (f *Frontier) Release(ctx context.Context, id int64) {
+	if f.sink != nil {
+		f.sink.queue(id, "pending", -1)
+		return
+	}
 	f.db.ExecContext(ctx, `UPDATE crawl_queue SET status='pending', updated_at=NOW() WHERE id=?`, id)
 }
 
@@ -160,15 +272,23 @@ func placeholders(n int) string {
 }
 
 func (f *Frontier) Done(ctx context.Context, id int64) {
+	if f.sink != nil {
+		f.sink.queue(id, "done", -1)
+		return
+	}
 	f.db.ExecContext(ctx, `UPDATE crawl_queue SET status='done', updated_at=NOW() WHERE id=?`, id)
 }
 
 func (f *Frontier) Fail(ctx context.Context, id int64, retries int) {
+	status := "pending"
 	if retries >= 3 {
-		f.db.ExecContext(ctx, `UPDATE crawl_queue SET status='error', retries=?, updated_at=NOW() WHERE id=?`, retries, id)
+		status = "error"
+	}
+	if f.sink != nil {
+		f.sink.queue(id, status, retries)
 		return
 	}
-	f.db.ExecContext(ctx, `UPDATE crawl_queue SET status='pending', retries=?, updated_at=NOW() WHERE id=?`, retries, id)
+	f.db.ExecContext(ctx, `UPDATE crawl_queue SET status=?, retries=?, updated_at=NOW() WHERE id=?`, status, retries, id)
 }
 
 func (f *Frontier) ResetStuck(ctx context.Context, olderThan time.Duration) {

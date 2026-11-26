@@ -28,6 +28,8 @@ func (s *Server) routeAdmin(w http.ResponseWriter, r *http.Request, sub string) 
 		s.aNodeReset(w, r)
 	case "nodes/weight":
 		s.aNodeWeight(w, r)
+	case "nodes/config":
+		s.aNodeConfig(w, r)
 	case "rules":
 		s.aRules(w, r)
 	case "seeds":
@@ -203,6 +205,85 @@ func (s *Server) aNodeWeight(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
 }
 
+// aNodeConfig 读取 / 保存单个节点的独立配置（并发、同域间隔、代理组、请求头等）。
+func (s *Server) aNodeConfig(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.URL.Query().Get("node_id")
+	if r.Method == http.MethodGet {
+		ov := s.nodeOverrides()
+		if nodeID == "" {
+			writeJSON(w, 200, map[string]interface{}{"overrides": ov})
+			return
+		}
+		writeJSON(w, 200, map[string]interface{}{
+			"node_id":  nodeID,
+			"override": ov[nodeID],
+			"defaults": map[string]interface{}{
+				"concurrency":            s.cfg.Crawler.Concurrency,
+				"per_domain_interval_ms": s.cfg.Crawler.PerDomainIntervalMS,
+				"max_pages_per_run":      s.cfg.Crawler.MaxPagesPerRun,
+				"max_db_docs":            s.cfg.Limits.MaxDBDocsPerNode,
+				"max_redis_docs":         s.cfg.Limits.MaxRedisDocs,
+				"mode":                   s.cfg.Crawler.Mode,
+				"proxy_group":            s.cfg.Crawler.ProxyGroup,
+			},
+			"hot_fields": []string{"concurrency", "per_domain_interval_ms", "max_pages_per_run", "weight"},
+			"self_id":    s.cfg.Cluster.NodeID,
+		})
+		return
+	}
+
+	var body struct {
+		NodeID string `json:"node_id"`
+		config.NodeOverride
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.NodeID == "" {
+		writeErr(w, 400, "参数错误")
+		return
+	}
+	all := s.nodeOverrides()
+	all[body.NodeID] = body.NodeOverride
+	b, _ := json.Marshal(all)
+	if err := s.db.SetConfig("node_override", string(b)); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+
+	// 本节点立即热生效；其它节点在 20 秒内的配置轮询中自动应用
+	applied := false
+	if body.NodeID == s.cfg.Cluster.NodeID {
+		s.applyHotConfig(body.NodeOverride)
+		applied = true
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": true, "applied_now": applied,
+		"note": "并发、同域间隔、单次上限、权重立即生效；模式/代理组/请求头在节点下一轮轮询后生效",
+	})
+}
+
+func (s *Server) applyHotConfig(o config.NodeOverride) {
+	if o.Concurrency != nil {
+		s.crawler.SetConcurrency(*o.Concurrency)
+	}
+	if o.PerDomainIntervalMS != nil {
+		s.crawler.SetPerDomainIntervalMS(*o.PerDomainIntervalMS)
+	}
+	if o.MaxPagesPerRun != nil {
+		s.crawler.SetMaxPages(*o.MaxPagesPerRun)
+	}
+	if o.Weight != nil && *o.Weight > 0 {
+		s.master.SetNodeWeight(s.cfg.Cluster.NodeID, *o.Weight)
+	}
+}
+
+func (s *Server) nodeOverrides() map[string]config.NodeOverride {
+	out := map[string]config.NodeOverride{}
+	raw := s.db.GetConfig("node_override", "")
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &out)
+	}
+	return out
+}
+
 func (s *Server) aRules(w http.ResponseWriter, r *http.Request) {
 	list := crawler.RuleList()
 	writeJSON(w, 200, map[string]interface{}{"rules": list, "total": len(list)})
@@ -269,6 +350,10 @@ func (s *Server) aCrawlStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) aCrawlStart(w http.ResponseWriter, r *http.Request) {
+	// 队列被清空后仍能一键恢复：种子表入库并补入队（幂等）
+	if n, err := s.crawler.LoadSeeds(r.Context()); err == nil && n > 0 {
+		_ = n
+	}
 	if err := s.startCrawl(r.Context()); err != nil {
 		writeErr(w, 500, err.Error())
 		return

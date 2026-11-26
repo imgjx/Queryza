@@ -6,10 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
+	"log"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"queryza/internal/algo"
@@ -26,6 +27,8 @@ type Indexer interface {
 type Ownership interface {
 	OwnDomain(domain string) bool
 	OwnedDomains() []string
+	// AssignDomain 为新域名建立副本分配，返回主副本节点 ID
+	AssignDomain(domain string) string
 }
 
 type Crawler struct {
@@ -38,17 +41,34 @@ type Crawler struct {
 	indexer  Indexer
 	owner    Ownership
 
+	writer *batchWriter
+
 	mu      sync.Mutex
 	running bool
 	stat    struct {
 		fetched, indexed, failed, discovered int64
+		skipped, duplicated                  int64
 		lastErr                              string
 		lastAt                               time.Time
 	}
+
+	// 站点权重缓存：原来每页查一次 seeds 表
+	wMu  sync.RWMutex
+	wMap map[string]float64
+	wAt  time.Time
+
+	// 精确内容去重：先查内存集合，未命中再落库核对
+	dMu  sync.Mutex
+	seen map[string]struct{}
+
+	// 抓取并发上限，可在后台按节点单独调整并热生效
+	concLimit atomic.Int64
+	inflight  atomic.Int64
+	maxPages  atomic.Int64
 }
 
 func New(cfg *config.Config, db *store.DB, cache *store.Cache, nodeID string, proxies []string, indexer Indexer) *Crawler {
-	return &Crawler{
+	c := &Crawler{
 		cfg:    cfg,
 		db:     db,
 		cache:  cache,
@@ -57,8 +77,42 @@ func New(cfg *config.Config, db *store.DB, cache *store.Cache, nodeID string, pr
 			cfg.Crawler.RespectRobots, cfg.Crawler.PerDomainIntervalMS),
 		frontier: NewFrontier(db, nodeID, cfg.Limits.CrawlQueueMax),
 		indexer:  indexer,
+		writer:   newBatchWriter(db),
 	}
+	c.frontier.setSink(c.writer)
+	conc := cfg.Crawler.Concurrency
+	if conc <= 0 {
+		conc = 8
+	}
+	c.concLimit.Store(int64(conc))
+	c.maxPages.Store(int64(cfg.Crawler.MaxPagesPerRun))
+	return c
 }
+
+// SetMaxPages 运行时调整单次运行抓取上限（0 表示不限）。
+func (c *Crawler) SetMaxPages(n int) {
+	if n < 0 {
+		n = 0
+	}
+	c.maxPages.Store(int64(n))
+}
+
+// SetConcurrency 运行时调整本节点抓取并发（线程数），下一次派发立即生效。
+func (c *Crawler) SetConcurrency(n int) {
+	if n <= 0 {
+		return
+	}
+	if n > 512 {
+		n = 512
+	}
+	c.concLimit.Store(int64(n))
+}
+
+// Concurrency 当前生效的并发数。
+func (c *Crawler) Concurrency() int { return int(c.concLimit.Load()) }
+
+// SetPerDomainIntervalMS 运行时调整同域请求间隔。
+func (c *Crawler) SetPerDomainIntervalMS(ms int) { c.fetcher.SetPerDomainIntervalMS(ms) }
 
 type seedDef struct {
 	URL      string  `json:"url"`
@@ -138,6 +192,13 @@ func (c *Crawler) domainAllowed(host string) bool {
 	return true
 }
 
+type indexJob struct {
+	doc    *store.Document
+	tokens []string
+}
+
+// Run 以流水线方式抓取：调度器按域名时隙派发，抓取 worker 只管取页面，
+// 索引写入交给独立 worker，互不阻塞。
 func (c *Crawler) Run(ctx context.Context) {
 	c.mu.Lock()
 	if c.running {
@@ -153,50 +214,149 @@ func (c *Crawler) Run(ctx context.Context) {
 	}()
 
 	c.frontier.ResetStuck(ctx, 5*time.Minute)
-	conc := c.cfg.Crawler.Concurrency
-	if conc <= 0 {
-		conc = 4
+
+	// 固定 worker 池，实际并发由 concLimit 控制，后台改配置无需重启
+	const maxWorkers = 256
+	work := make(chan Task, maxWorkers)
+	idxCh := make(chan indexJob, 2048)
+
+	var fetchWG sync.WaitGroup
+	for i := 0; i < maxWorkers; i++ {
+		fetchWG.Add(1)
+		go func() {
+			defer fetchWG.Done()
+			for t := range work {
+				c.process(ctx, t, idxCh)
+				c.inflight.Add(-1)
+			}
+		}()
 	}
-	sem := make(chan struct{}, conc)
 
+	// 索引写库与抓取解耦：抓取不再等事务提交，索引也可批量攒批
+	var idxWG sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		idxWG.Add(1)
+		go func() {
+			defer idxWG.Done()
+			for j := range idxCh {
+				c.writeIndex(j)
+			}
+		}()
+	}
+
+	c.dispatch(ctx, work)
+
+	close(work)
+	fetchWG.Wait()
+	close(idxCh)
+	idxWG.Wait()
+}
+
+// dispatch 只把「该域名此刻允许发起请求」的任务放进 work，
+// 否则留在内存里等下一轮，worker 不会卡在 sleep 上白占并发。
+func (c *Crawler) dispatch(ctx context.Context, out chan<- Task) {
+	// 按域名分桶：队列里同一站点的链接往往成百上千连在一起，
+	// 若按顺序派发会被单个域名的间隔限制卡死（曾经只有 5 页/秒）。
+	const poolMax = 512
+	const lowWater = 256
+
+	buckets := map[string][]Task{}
+	lastDomains := time.Time{}
+	lastLog := time.Now()
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		default:
 		}
-		// 每轮检查是否超过单次运行上限
-		c.mu.Lock()
-		fetched := c.stat.fetched
-		c.mu.Unlock()
-		if c.cfg.Crawler.MaxPagesPerRun > 0 && fetched >= int64(c.cfg.Crawler.MaxPagesPerRun) {
-			time.Sleep(2 * time.Second)
-			continue
+		// 新入队的域名先落副本分配，否则不会出现在本节点的可领取白名单里
+		if c.owner != nil {
+			for _, d := range c.frontier.DrainNewDomains() {
+				c.owner.AssignDomain(d)
+			}
+			if time.Since(lastDomains) > 5*time.Second {
+				c.frontier.SetDomains(c.owner.OwnedDomains())
+				lastDomains = time.Now()
+			}
 		}
 
-		if c.owner != nil {
-			c.frontier.SetDomains(c.owner.OwnedDomains())
+		limit := c.concLimit.Load()
+		sent := 0
+		for dom, list := range buckets {
+			if c.inflight.Load() >= limit {
+				break
+			}
+			if len(list) == 0 {
+				delete(buckets, dom)
+				continue
+			}
+			if !c.fetcher.TakeSlot(dom) {
+				continue
+			}
+			select {
+			case out <- list[0]:
+				c.inflight.Add(1)
+				sent++
+				buckets[dom] = list[1:]
+			case <-ctx.Done():
+				return
+			}
 		}
-		tasks, err := c.frontier.Lease(ctx, conc)
-		if err != nil || len(tasks) == 0 {
-			time.Sleep(800 * time.Millisecond)
-			continue
+
+		total := 0
+		for _, l := range buckets {
+			total += len(l)
 		}
-		var wg sync.WaitGroup
-		for _, t := range tasks {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(t Task) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				c.process(ctx, t)
-			}(t)
+		if total < lowWater && !c.overLimit() {
+			n := poolMax - total
+			if n > 64 {
+				n = 64
+			}
+			if tasks, err := c.frontier.Lease(ctx, n); err == nil && len(tasks) > 0 {
+				for _, t := range tasks {
+					buckets[t.Domain] = append(buckets[t.Domain], t)
+				}
+			}
 		}
-		wg.Wait()
+
+		if debugDispatch && time.Since(lastLog) > time.Second {
+			lastLog = time.Now()
+			log.Printf("[dispatch] sent=%d buckets=%d total=%d inflight=%d limit=%d", sent, len(buckets), total, c.inflight.Load(), limit)
+		}
+
+		switch {
+		case sent > 0:
+			// 有进展，立即继续
+		case total == 0:
+			sleepCtx(ctx, 250*time.Millisecond)
+		default:
+			// 全在等各域名时隙，短暂等待后重试
+			sleepCtx(ctx, 15*time.Millisecond)
+		}
 	}
 }
 
-func (c *Crawler) process(ctx context.Context, t Task) {
+var debugDispatch = os.Getenv("QZ_DEBUG_DISPATCH") != ""
+
+func sleepCtx(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+func (c *Crawler) overLimit() bool {
+	max := c.maxPages.Load()
+	if max <= 0 {
+		return false
+	}
+	c.mu.Lock()
+	n := c.stat.fetched
+	c.mu.Unlock()
+	return n >= max
+}
+
+func (c *Crawler) process(ctx context.Context, t Task, idxCh chan<- indexJob) {
 	if !c.domainAllowed(t.Domain) {
 		c.frontier.Done(ctx, t.ID)
 		return
@@ -206,7 +366,7 @@ func (c *Crawler) process(ctx context.Context, t Task) {
 		c.frontier.Release(ctx, t.ID)
 		return
 	}
-	res := c.fetcher.Fetch(ctx, t.URL)
+	res := c.fetcher.FetchScheduled(ctx, t.URL)
 
 	// 先解析，日志里带上命中的清洗规则，便于观察规则库效果
 	var page *Page
@@ -241,11 +401,13 @@ func (c *Crawler) process(ctx context.Context, t Task) {
 		return
 	}
 	if len(page.Text) < 30 {
+		c.bumpSkip()
 		c.frontier.Done(ctx, t.ID)
 		return
 	}
 	// 导航页 / 列表页：没定位到正文容器且链接文字占比高，不入索引（链接仍参与扩散）
 	if !page.Confident && page.LinkDensity > 0.45 {
+		c.bumpSkip()
 		c.frontier.Done(ctx, t.ID)
 		return
 	}
@@ -253,11 +415,35 @@ func (c *Crawler) process(ctx context.Context, t Task) {
 	ch := sha256.Sum256([]byte(page.Text))
 	contentHash := hex.EncodeToString(ch[:])
 
-	// 精确内容去重：已存在同内容页面则跳过索引
-	var exists int64
-	c.db.QueryRowContext(ctx, `SELECT id FROM documents WHERE content_hash=? LIMIT 1`, contentHash).Scan(&exists)
-
 	tokens := algo.Tokenize(page.Title + " " + page.Text)
+
+	// 链接扩散先做，不等索引
+	if c.cfg.Crawler.Mode == "full" && t.Depth < c.cfg.Crawler.MaxDepth {
+		tasks := make([]Task, 0, len(page.Links))
+		seedsDepth := t.Depth + 1
+		for _, link := range page.Links {
+			h := hostOf(link)
+			if !c.domainAllowed(h) {
+				continue
+			}
+			tasks = append(tasks, Task{URL: link, URLHash: URLHash(link), Domain: h, Depth: seedsDepth, Priority: 10})
+		}
+		if n, _ := c.frontier.Enqueue(ctx, tasks); n > 0 {
+			c.mu.Lock()
+			c.stat.discovered += int64(n)
+			c.mu.Unlock()
+		}
+	}
+	c.frontier.Done(ctx, t.ID)
+
+	// 精确内容去重：内存集合挡住绝大多数重复页，未命中再落库核对
+	if c.alreadySeen(ctx, contentHash) {
+		c.mu.Lock()
+		c.stat.duplicated++
+		c.mu.Unlock()
+		return
+	}
+
 	doc := &store.Document{
 		URL:           t.URL,
 		URLHash:       t.URLHash,
@@ -276,44 +462,98 @@ func (c *Crawler) process(ctx context.Context, t Task) {
 		CreatedAt:     time.Now(),
 	}
 
-	if exists == 0 {
-		if err := c.indexer.IndexDocument(ctx, doc, tokens); err != nil {
-			c.mu.Lock()
-			c.stat.failed++
-			c.stat.lastErr = err.Error()
-			c.mu.Unlock()
-			c.frontier.Fail(ctx, t.ID, 1)
-			return
-		}
+	select {
+	case idxCh <- indexJob{doc: doc, tokens: tokens}:
+	case <-ctx.Done():
+	}
+}
+
+func (c *Crawler) bumpSkip() {
+	c.mu.Lock()
+	c.stat.skipped++
+	c.mu.Unlock()
+}
+
+func (c *Crawler) writeIndex(j indexJob) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := c.indexer.IndexDocument(ctx, j.doc, j.tokens); err != nil {
 		c.mu.Lock()
-		c.stat.indexed++
+		c.stat.failed++
+		c.stat.lastErr = err.Error()
 		c.mu.Unlock()
+		return
 	}
+	c.mu.Lock()
+	c.stat.indexed++
+	c.mu.Unlock()
+}
 
-	// 仅全网模式启用域名自发现
-	if c.cfg.Crawler.Mode == "full" && t.Depth < c.cfg.Crawler.MaxDepth {
-		var tasks []Task
-		seedsDepth := t.Depth + 1
-		for _, link := range page.Links {
-			h := hostOf(link)
-			if !c.domainAllowed(h) {
-				continue
-			}
-			tasks = append(tasks, Task{URL: link, URLHash: URLHash(link), Domain: h, Depth: seedsDepth, Priority: 10})
-		}
-		if n, _ := c.frontier.Enqueue(ctx, tasks); n > 0 {
-			c.mu.Lock()
-			c.stat.discovered += int64(n)
-			c.mu.Unlock()
-		}
+// alreadySeen 判断内容是否已入库；内存命中直接返回，未命中查库并回填。
+func (c *Crawler) alreadySeen(ctx context.Context, hash string) bool {
+	c.dMu.Lock()
+	if _, ok := c.seen[hash]; ok {
+		c.dMu.Unlock()
+		return true
 	}
+	c.dMu.Unlock()
 
-	c.frontier.Done(ctx, t.ID)
+	var id int64
+	err := c.db.QueryRowContext(ctx, `SELECT id FROM documents WHERE content_hash=? LIMIT 1`, hash).Scan(&id)
+	if err == nil && id > 0 {
+		c.rememberHash(hash)
+		return true
+	}
+	return false
+}
+
+func (c *Crawler) rememberHash(hash string) {
+	c.dMu.Lock()
+	if c.seen == nil {
+		c.seen = make(map[string]struct{}, 1024)
+	}
+	if len(c.seen) > 500000 {
+		// 简单裁剪：超限后清空，重复内容由数据库唯一键兜底
+		c.seen = make(map[string]struct{}, 1024)
+	}
+	c.seen[hash] = struct{}{}
+	c.dMu.Unlock()
 }
 
 func (c *Crawler) domainWeight(ctx context.Context, domain string) float64 {
-	var w float64
-	if err := c.db.QueryRowContext(ctx, `SELECT weight FROM seeds WHERE domain=? LIMIT 1`, domain).Scan(&w); err == nil && w > 0 {
+	c.wMu.RLock()
+	if c.wMap != nil && time.Since(c.wAt) < 60*time.Second {
+		w := c.wMap[domain]
+		c.wMu.RUnlock()
+		if w <= 0 {
+			w = 1
+		}
+		return w
+	}
+	c.wMu.RUnlock()
+
+	c.wMu.Lock()
+	defer c.wMu.Unlock()
+	if c.wMap != nil && time.Since(c.wAt) < 60*time.Second {
+		if w := c.wMap[domain]; w > 0 {
+			return w
+		}
+		return 1
+	}
+	next := map[string]float64{}
+	rows, err := c.db.QueryContext(ctx, `SELECT domain, MAX(weight) FROM seeds GROUP BY domain`)
+	if err == nil {
+		for rows.Next() {
+			var d string
+			var w float64
+			if rows.Scan(&d, &w) == nil && w > 0 {
+				next[d] = w
+			}
+		}
+		rows.Close()
+	}
+	c.wMap, c.wAt = next, time.Now()
+	if w := next[domain]; w > 0 {
 		return w
 	}
 	return 1.0
@@ -327,8 +567,10 @@ func (c *Crawler) logFetch(ctx context.Context, t Task, res *FetchResult, ruleID
 	if len(errStr) > 500 {
 		errStr = errStr[:500]
 	}
-	c.db.ExecContext(ctx, `INSERT INTO crawl_logs(url,domain,status,http_code,bytes,error,duration_ms,node_id,rule_id)
-		VALUES(?,?,?,?,?,?,?,?,?)`, t.URL, t.Domain, statusOf(res), res.Status, len(res.Body), errStr, res.DurationMS, c.nodeID, ruleID)
+	c.writer.log(logRec{
+		url: t.URL, domain: t.Domain, status: statusOf(res), httpCode: res.Status,
+		bytes: len(res.Body), errStr: errStr, durMS: res.DurationMS, nodeID: c.nodeID, ruleID: ruleID,
+	})
 }
 
 func statusOf(res *FetchResult) string {
@@ -350,6 +592,10 @@ func (c *Crawler) Stats() map[string]interface{} {
 		"indexed":    c.stat.indexed,
 		"failed":     c.stat.failed,
 		"discovered": c.stat.discovered,
+		"skipped":    c.stat.skipped,
+		"duplicated": c.stat.duplicated,
+		"inflight":   c.inflight.Load(),
+		"concurrency": c.concLimit.Load(),
 		"last_error": c.stat.lastErr,
 		"last_at":    c.stat.lastAt,
 		"mode":       c.cfg.Crawler.Mode,
@@ -383,9 +629,7 @@ func (c *Crawler) owns(domain string) bool {
 func simhash64(tokens []string) int64 {
 	var v [64]int
 	for _, t := range tokens {
-		h := fnv.New64a()
-		h.Write([]byte(t))
-		x := h.Sum64()
+		x := fnv1a64(t)
 		for i := 0; i < 64; i++ {
 			if x&(1<<uint(i)) != 0 {
 				v[i]++
@@ -401,4 +645,18 @@ func simhash64(tokens []string) int64 {
 		}
 	}
 	return int64(f)
+}
+
+// fnv1a64 内联 FNV-1a，避免每个词项都分配一个 hash.Hash。
+func fnv1a64(s string) uint64 {
+	const (
+		offset = 14695981039346656037
+		prime  = 1099511628211
+	)
+	h := uint64(offset)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
 }

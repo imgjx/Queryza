@@ -37,7 +37,7 @@ type Fetcher struct {
 	// 同域最小请求间隔，避免把站点打出 429
 	gateMu   sync.Mutex
 	gateNext map[string]time.Time
-	gateGap  time.Duration
+	gateGapN atomic.Int64 // 同域最小间隔（纳秒），支持运行时热更
 }
 
 type robotsEntry struct {
@@ -61,8 +61,8 @@ func NewFetcher(headers map[string]string, proxies []string, timeoutSec int, res
 		timeout:       time.Duration(timeoutSec) * time.Second,
 		respectRobots: respectRobots,
 		gateNext:      map[string]time.Time{},
-		gateGap:       time.Duration(perDomainMS) * time.Millisecond,
 	}
+	f.gateGapN.Store(int64(perDomainMS) * int64(time.Millisecond))
 	f.noProxyClient = &http.Client{Timeout: f.timeout, Transport: f.transport("")}
 	return f
 }
@@ -103,6 +103,32 @@ func (f *Fetcher) pickProxy() string {
 }
 
 func (f *Fetcher) Fetch(ctx context.Context, rawURL string) *FetchResult {
+	return f.fetch(ctx, rawURL, true)
+}
+
+// FetchScheduled 用于调度器已经通过 TakeSlot 预约过时隙的任务，不再二次等待。
+func (f *Fetcher) FetchScheduled(ctx context.Context, rawURL string) *FetchResult {
+	return f.fetch(ctx, rawURL, false)
+}
+
+// TakeSlot 若该域名当前可发起请求，则预约下一个时隙并返回 true。
+// 由调度器在派发前调用，把「等间隔」放到派发侧，避免 worker 空转。
+func (f *Fetcher) TakeSlot(host string) bool {
+	gap := f.gap()
+	if gap <= 0 || host == "" {
+		return true
+	}
+	f.gateMu.Lock()
+	defer f.gateMu.Unlock()
+	now := time.Now()
+	if next := f.gateNext[host]; next.After(now) {
+		return false
+	}
+	f.gateNext[host] = now.Add(gap)
+	return true
+}
+
+func (f *Fetcher) fetch(ctx context.Context, rawURL string, throttle bool) *FetchResult {
 	start := time.Now()
 	res := &FetchResult{URL: rawURL}
 
@@ -113,7 +139,7 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) *FetchResult {
 		return res
 	}
 
-	if !f.waitDomain(ctx, u.Host) {
+	if throttle && !f.waitDomain(ctx, u.Host) {
 		res.Err = ctx.Err()
 		res.DurationMS = int(time.Since(start).Milliseconds())
 		return res
@@ -248,7 +274,8 @@ func matchRobots(rules []robotsRule, path string) bool {
 
 // waitDomain 保证同一域名两次请求之间至少间隔 gateGap。
 func (f *Fetcher) waitDomain(ctx context.Context, host string) bool {
-	if f.gateGap <= 0 || host == "" {
+	gap := f.gap()
+	if gap <= 0 || host == "" {
 		return true
 	}
 	f.gateMu.Lock()
@@ -257,7 +284,7 @@ func (f *Fetcher) waitDomain(ctx context.Context, host string) bool {
 	if next.Before(now) {
 		next = now
 	}
-	f.gateNext[host] = next.Add(f.gateGap)
+	f.gateNext[host] = next.Add(gap)
 	f.gateMu.Unlock()
 
 	if d := time.Until(next); d > 0 {
@@ -271,3 +298,13 @@ func (f *Fetcher) waitDomain(ctx context.Context, host string) bool {
 	}
 	return true
 }
+
+// SetPerDomainIntervalMS 运行时调整同域请求间隔（0 表示不限制）。
+func (f *Fetcher) SetPerDomainIntervalMS(ms int) {
+	if ms < 0 {
+		ms = 0
+	}
+	f.gateGapN.Store(int64(ms) * int64(time.Millisecond))
+}
+
+func (f *Fetcher) gap() time.Duration { return time.Duration(f.gateGapN.Load()) }

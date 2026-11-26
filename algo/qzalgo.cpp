@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cmath>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_set>
 
@@ -49,8 +50,8 @@ bool is_cjk(uint32_t cp) {
 }
 
 // 中文单字停用
-const std::unordered_set<std::string>& cn_stop() {
-    static const std::unordered_set<std::string> s = {
+const std::unordered_set<std::string_view>& cn_stop() {
+    static const std::unordered_set<std::string_view> s = {
         "的","了","和","是","在","有","就","不","人","都","一","上","也","很","到",
         "说","要","去","你","会","着","看","好","这","那","之","与","及","等","被",
         "把","让","对","从","而","或","但","因","为","我","他","她","它","们","个",
@@ -62,8 +63,8 @@ const std::unordered_set<std::string>& cn_stop() {
 }
 
 // 英文停用词
-const std::unordered_set<std::string>& en_stop() {
-    static const std::unordered_set<std::string> s = {
+const std::unordered_set<std::string_view>& en_stop() {
+    static const std::unordered_set<std::string_view> s = {
         "the","a","an","and","or","of","to","in","is","are","was","were","be","been",
         "being","for","on","at","by","with","as","from","that","this","these","those",
         "it","its","i","you","he","she","they","we","my","your","his","her","their",
@@ -176,6 +177,116 @@ char* qz_tokenize(const char* text) {
     char* res = (char*)malloc(out.size() + 1);
     memcpy(res, out.data(), out.size());
     res[out.size()] = '\0';
+    return res;
+}
+
+// ---------- 紧凑分词：'\0' 分隔，零 JSON 开销 ----------
+
+namespace {
+
+struct Slice {
+    const char* p;
+    int len;
+};
+
+// 停用词用 string_view 查表，避免为每个单字构造 std::string
+inline void emit_sv(std::string& out, std::string_view sv) {
+    out.append(sv.data(), sv.size());
+    out.push_back('\0');
+}
+
+} // namespace
+
+char* qz_tokenize_flat(const char* text, int* out_count, int* out_size) {
+    if (out_count) *out_count = 0;
+    if (out_size) *out_size = 0;
+    std::string out;
+    if (!text) {
+        char* r = (char*)malloc(1);
+        r[0] = '\0';
+        return r;
+    }
+
+    const unsigned char* p = (const unsigned char*)text;
+    int n = (int)strlen(text);
+    int i = 0;
+    int count = 0;
+
+    std::string ascii;
+    std::vector<Slice> cjk_run;
+    cjk_run.reserve(64);
+
+    auto flush_ascii = [&]() {
+        if (ascii.empty()) return;
+        for (auto& ch : ascii) ch = (char)tolower((unsigned char)ch);
+        std::string_view sv(ascii);
+        if (sv.size() > 1) {
+            if (!en_stop().count(sv)) { emit_sv(out, sv); count++; }
+        } else if (!en_stop().count(sv) && !isdigit((unsigned char)sv[0])) {
+            emit_sv(out, sv);
+            count++;
+        }
+        ascii.clear();
+    };
+
+    auto flush_cjk = [&]() {
+        if (cjk_run.empty()) return;
+        const auto& stop = cn_stop();
+        if (cjk_run.size() == 1) {
+            std::string_view a(cjk_run[0].p, cjk_run[0].len);
+            if (!stop.count(a)) { emit_sv(out, a); count++; }
+        } else {
+            char buf[8];
+            for (size_t k = 0; k + 1 < cjk_run.size(); ++k) {
+                const Slice& a = cjk_run[k];
+                const Slice& b = cjk_run[k + 1];
+                std::string_view av(a.p, a.len), bv(b.p, b.len);
+                if (stop.count(av) && stop.count(bv)) continue;
+                int len = a.len + b.len;
+                memcpy(buf, a.p, a.len);
+                memcpy(buf + a.len, b.p, b.len);
+                out.append(buf, len);
+                out.push_back('\0');
+                count++;
+            }
+        }
+        cjk_run.clear();
+    };
+
+    while (i < n) {
+        unsigned char c = p[i];
+        if (c < 0x80) {
+            if (is_ascii_alnum(c)) {
+                flush_cjk();
+                ascii += (char)c;
+                i += 1;
+            } else {
+                flush_ascii();
+                flush_cjk();
+                i += 1;
+            }
+        } else {
+            Rune r = decode(p + i, n - i);
+            if (is_cjk(r.cp)) {
+                flush_ascii();
+                cjk_run.push_back(Slice{(const char*)p + i, r.len});
+            } else {
+                flush_ascii();
+                flush_cjk();
+            }
+            i += r.len;
+        }
+    }
+    flush_ascii();
+    flush_cjk();
+
+    size_t sz = out.size();
+    char* res = (char*)malloc(sz + 1);
+    if (!res) return nullptr;
+    if (sz) memcpy(res, out.data(), sz);
+    res[sz] = '\0';
+    if (out_count) *out_count = count;
+    if (out_size) *out_size = (int)sz;
     return res;
 }
 

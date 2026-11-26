@@ -104,6 +104,11 @@ func main() {
 	embedder := index.NewEmbedder(cfg.Embedding)
 	indexer := index.NewIndexer(db, cache, cfg.Limits, embedder)
 	searcher := search.New(db, cache, cfg.Search, embedder, cfg.Cluster.NodeID)
+	// 内存倒排索引：后台全量加载，就绪后检索走内存
+	memIdx := index.NewMemIndex(cfg.Limits.MaxMemDocs)
+	indexer.SetMemIndex(memIdx)
+	searcher.SetMemIndex(memIdx)
+	go memIdx.Build(db)
 
 	proxies := loadProxyGroup(db, cfg.Crawler.ProxyGroup)
 	cr := crawler.New(cfg, db, cache, cfg.Cluster.NodeID, proxies, indexer)
@@ -117,8 +122,12 @@ func main() {
 	// 域名按主副本归属：只有主副本负责抓取与入库
 	cr.SetOwnership(master)
 
+	// 后台「节点管理」里设置的独立配置：启动时全量应用，运行时每 20 秒轮询热更
+	lastCfgFp := applyNodeOverride(db, cfg, cr)
+
 	ctx, stopContext := context.WithCancel(context.Background())
 	defer stopContext()
+	go watchNodeOverride(ctx, db, cfg, cr, lastCfgFp)
 	go master.StartMaintenance(ctx)
 	go func() {
 		if n := master.BackfillAssignments(ctx); n > 0 {
@@ -220,8 +229,77 @@ func main() {
 	log.Println("已退出")
 }
 
-func loadProxyGroup(db *store.DB, name string) []string {
-	if name == "" {
+// applyNodeOverride 读取后台保存的本节点独立配置并应用（启动时全量生效）。
+// 返回该节点配置的指纹，供运行时轮询比对。
+func applyNodeOverride(db *store.DB, cfg *config.Config, cr *crawler.Crawler) string {
+	raw := db.GetConfig("node_override", "")
+	if raw == "" {
+		return ""
+	}
+	var all map[string]config.NodeOverride
+	if err := json.Unmarshal([]byte(raw), &all); err != nil {
+		return ""
+	}
+	o, ok := all[cfg.Cluster.NodeID]
+	if !ok {
+		return ""
+	}
+	cfg.ApplyValues(o)
+	if cr != nil {
+		cr.SetConcurrency(cfg.Crawler.Concurrency)
+		cr.SetPerDomainIntervalMS(cfg.Crawler.PerDomainIntervalMS)
+		cr.SetMaxPages(cfg.Crawler.MaxPagesPerRun)
+	}
+	log.Printf("已应用节点独立配置: 并发=%d 同域间隔=%dms 单次上限=%d",
+		cfg.Crawler.Concurrency, cfg.Crawler.PerDomainIntervalMS, cfg.Crawler.MaxPagesPerRun)
+	b, _ := json.Marshal(o)
+	return string(b)
+}
+
+// watchNodeOverride 轮询后台下发的节点配置，只热更数值项，避免与抓取协程争用配置结构。
+func watchNodeOverride(ctx context.Context, db *store.DB, cfg *config.Config, cr *crawler.Crawler, last string) {
+	t := time.NewTicker(20 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		raw := db.GetConfig("node_override", "")
+		if raw == "" {
+			continue
+		}
+		var all map[string]config.NodeOverride
+		if json.Unmarshal([]byte(raw), &all) != nil {
+			continue
+		}
+		o, ok := all[cfg.Cluster.NodeID]
+		if !ok {
+			continue
+		}
+		b, _ := json.Marshal(o)
+		fp := string(b)
+		if fp == last {
+			continue
+		}
+		last = fp
+		if cr != nil {
+			if o.Concurrency != nil {
+				cr.SetConcurrency(*o.Concurrency)
+			}
+			if o.PerDomainIntervalMS != nil {
+				cr.SetPerDomainIntervalMS(*o.PerDomainIntervalMS)
+			}
+			if o.MaxPagesPerRun != nil {
+				cr.SetMaxPages(*o.MaxPagesPerRun)
+			}
+		}
+		log.Printf("节点配置已更新（后台下发）: %s", fp)
+	}
+}
+
+func loadProxyGroup(db *store.DB, name string) []string {	if name == "" {
 		return nil
 	}
 	raw := db.GetConfig("proxy_groups", "")

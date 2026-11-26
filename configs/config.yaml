@@ -106,3 +106,5 @@ limits:
   max_redis_docs: 20000
   max_redis_hot: 200
   crawl_queue_max: 500000
+  # 内存倒排索引的文档上限：2900 篇约占 150MB，超过则检索回落到 SQL
+  max_mem_docs: 200000
