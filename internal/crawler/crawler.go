@@ -23,12 +23,17 @@ type Indexer interface {
 	IndexDocument(ctx context.Context, doc *store.Document, tokens []string) error
 }
 
-// Ownership 判断域名是否由本节点负责（主副本），用于多节点分片。
+// Ownership 判断域名（分片）是否由本节点负责，用于多节点分片。
 type Ownership interface {
 	OwnDomain(domain string) bool
 	OwnedDomains() []string
-	// AssignDomain 为新域名建立副本分配，返回主副本节点 ID
+	// AssignDomain 为新域名建立副本分配，返回主副本节点 ID（shard 0）
 	AssignDomain(domain string) string
+	// ShardOf 计算 URL 所属分片，ShardsOf 返回域名分片数
+	ShardOf(domain, urlHash string) int
+	ShardsOf(domain string) int
+	// OwnRoute 判断本节点是否为该分片的主副本
+	OwnRoute(domain string, shard int) bool
 }
 
 type Crawler struct {
@@ -167,7 +172,7 @@ func (c *Crawler) LoadSeeds(ctx context.Context) (int, error) {
 			})
 		}
 	}
-	_, _ = c.frontier.Enqueue(ctx, tasks)
+	_, _ = c.frontier.Enqueue(ctx, c.prepareTasks(tasks))
 	return added, nil
 }
 
@@ -361,8 +366,8 @@ func (c *Crawler) process(ctx context.Context, t Task, idxCh chan<- indexJob) {
 		c.frontier.Done(ctx, t.ID)
 		return
 	}
-	// 多节点下域名按主副本归属：非主副本不重复抓取同一份数据
-	if !c.owns(t.Domain) {
+	// 多节点下按「域名+分片」归属：非本节点分片不重复抓取同一份数据
+	if !c.ownsRoute(t.Domain, t.Shard) {
 		c.frontier.Release(ctx, t.ID)
 		return
 	}
@@ -428,7 +433,7 @@ func (c *Crawler) process(ctx context.Context, t Task, idxCh chan<- indexJob) {
 			}
 			tasks = append(tasks, Task{URL: link, URLHash: URLHash(link), Domain: h, Depth: seedsDepth, Priority: 10})
 		}
-		if n, _ := c.frontier.Enqueue(ctx, tasks); n > 0 {
+		if n, _ := c.frontier.Enqueue(ctx, c.prepareTasks(tasks)); n > 0 {
 			c.mu.Lock()
 			c.stat.discovered += int64(n)
 			c.mu.Unlock()
@@ -448,6 +453,7 @@ func (c *Crawler) process(ctx context.Context, t Task, idxCh chan<- indexJob) {
 		URL:           t.URL,
 		URLHash:       t.URLHash,
 		Domain:        t.Domain,
+		Shard:         t.Shard,
 		Title:         page.Title,
 		Content:       page.Text,
 		ContentLen:    len(tokens),
@@ -611,13 +617,46 @@ func (c *Crawler) EnqueueURLs(ctx context.Context, urls []string, depth, priorit
 		}
 		tasks = append(tasks, Task{URL: u, URLHash: URLHash(u), Domain: h, Depth: depth, Priority: priority})
 	}
-	return c.frontier.Enqueue(ctx, tasks)
+	return c.frontier.Enqueue(ctx, c.prepareTasks(tasks))
 }
 
 func (c *Crawler) Frontier() *Frontier { return c.frontier }
 
 // SetOwnership 设置域名归属判断；为空表示单机模式，全部由本节点处理。
 func (c *Crawler) SetOwnership(o Ownership) { c.owner = o }
+
+// prepareTasks 给任务标上分片，并丢弃不属于本节点的分片。
+// 不做这一步的话，每个节点都会把所有域名领一遍再释放，
+// 队列里几万个任务反复空转，看起来就是「另一个节点完全不干活」。
+func (c *Crawler) prepareTasks(tasks []Task) []Task {
+	if len(tasks) == 0 {
+		return tasks
+	}
+	out := tasks[:0]
+	for _, t := range tasks {
+		if t.URLHash == "" {
+			t.URLHash = URLHash(t.URL)
+		}
+		if c.owner != nil {
+			shards := c.owner.ShardsOf(t.Domain)
+			if shards > 1 {
+				t.Shard = c.owner.ShardOf(t.Domain, t.URLHash)
+			}
+			if !c.owner.OwnRoute(t.Domain, t.Shard) {
+				continue
+			}
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+func (c *Crawler) ownsRoute(domain string, shard int) bool {
+	if c.owner == nil {
+		return true
+	}
+	return c.owner.OwnRoute(domain, shard)
+}
 
 func (c *Crawler) owns(domain string) bool {
 	if c.owner == nil {

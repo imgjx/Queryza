@@ -64,6 +64,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/internal/search", s.handleInternalSearch)
 	mux.HandleFunc("/internal/assign", s.handleAssign)
 	mux.HandleFunc("/internal/ping", s.handlePing)
+	mux.HandleFunc("/internal/docs", s.handleInternalDocs)
 
 	// 子节点只提供内部接口：不带管理界面，也不对外暴露检索 API
 	if s.cfg.Cluster.Role == "node" {
@@ -198,6 +199,32 @@ func (s *Server) handleInternalCrawl(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "running": s.crawlRunning()})
 }
 
+func (s *Server) handleInternalDocs(w http.ResponseWriter, r *http.Request) {
+	_, body, ok := s.requireInternal(w, r)
+	if !ok {
+		return
+	}
+	var req cluster.InternalDocsReq
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, 200, cluster.InternalDocsResp{OK: false, Err: "bad request"})
+		return
+	}
+	q := store.DocQuery{Page: req.Page, Size: req.Size, Q: req.Q, Domain: req.Domain, Shard: -1}
+	if req.Shard != nil {
+		q.Shard = *req.Shard
+	}
+	docs, total, err := s.db.QueryDocs(r.Context(), q)
+	if err != nil {
+		writeJSON(w, 200, cluster.InternalDocsResp{OK: false, Err: err.Error()})
+		return
+	}
+	st := s.db.Stats(r.Context())
+	writeJSON(w, 200, cluster.InternalDocsResp{
+		OK: true, Docs: docs, Total: total, Page: q.Page, Size: q.Size,
+		Stats: &st, TopDomains: s.db.TopDomains(r.Context(), 12),
+	})
+}
+
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"ok": true, "node_id": s.cfg.Cluster.NodeID, "role": s.cfg.Cluster.Role,
@@ -305,6 +332,8 @@ func (s *Server) routeAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleLogin(w, r)
 	case p == "/api/v1/search":
 		s.handlePublicSearch(w, r)
+	case p == "/api/v1/suggest":
+		s.handleSuggest(w, r)
 	case strings.HasPrefix(p, "/api/v1/admin/"):
 		if !s.checkAdmin(r) {
 			writeErr(w, http.StatusUnauthorized, "未登录或登录已过期")
@@ -353,18 +382,29 @@ func (s *Server) extractAPIKey(r *http.Request) string {
 }
 
 func (s *Server) handlePublicSearch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Query  string `json:"query"`
+		Q      string `json:"q"`
+		TopK   int    `json:"top_k"`
+		Size   int    `json:"size"`
+		Page   int    `json:"page"`
+		Offset int    `json:"offset"`
+	}
 	q := r.URL.Query().Get("q")
+	req.Size = atoiDefault(r.URL.Query().Get("size"), 0)
+	if req.Size == 0 {
+		req.Size = atoiDefault(r.URL.Query().Get("top_k"), 0)
+	}
+	req.Page = atoiDefault(r.URL.Query().Get("page"), 1)
+	req.Offset = atoiDefault(r.URL.Query().Get("offset"), -1)
+
 	if r.Method == http.MethodPost {
-		var body struct {
-			Query string `json:"query"`
-			Q     string `json:"q"`
-			TopK  int    `json:"top_k"`
-		}
-		json.NewDecoder(r.Body).Decode(&body)
-		if body.Query != "" {
-			q = body.Query
-		} else if body.Q != "" {
-			q = body.Q
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			if req.Query != "" {
+				q = req.Query
+			} else if req.Q != "" {
+				q = req.Q
+			}
 		}
 	}
 	key, err := s.keys.Verify(r.Context(), s.extractAPIKey(r))
@@ -372,18 +412,91 @@ func (s *Server) handlePublicSearch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	topK := atoiDefault(r.URL.Query().Get("top_k"), s.cfg.Search.TopK)
-	if key.ResultMax > 0 && topK > key.ResultMax {
-		topK = key.ResultMax
+
+	size := req.Size
+	if size <= 0 {
+		size = s.cfg.Search.TopK
 	}
-	res, err := s.master.Search(r.Context(), q, topK)
+	if size > 100 {
+		size = 100
+	}
+	if key.ResultMax > 0 && size > key.ResultMax {
+		size = key.ResultMax
+	}
+	page := req.Page
+	if page < 1 {
+		page = 1
+	}
+	offset := req.Offset
+	if offset < 0 {
+		offset = (page - 1) * size
+	} else {
+		page = offset/size + 1
+	}
+
+	res, err := s.master.Search(r.Context(), q, size, offset)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	res.Paginate(page, size)
 	s.db.ExecContext(r.Context(), `INSERT INTO query_logs(query,results,latency_ms,key_id,node_id) VALUES(?,?,?,?,?)`,
 		q, len(res.Hits), res.TookMS, key.ID, s.cfg.Cluster.NodeID)
 	writeJSON(w, 200, res)
+}
+
+// handleSuggest 前缀补全，供搜索框联想；与检索共用 API 密钥。
+func (s *Server) handleSuggest(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.keys.Verify(r.Context(), s.extractAPIKey(r)); err != nil {
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"query": r.URL.Query().Get("q"),
+		"items": s.suggest(r.Context(), r.URL.Query().Get("q")),
+	})
+}
+
+// suggest 联想词：优先历史真实查询（完整短语），再用词项前缀兜底。
+// bigram 索引里没有完整中文词，只靠 terms 前缀补全效果很差。
+func (s *Server) suggest(ctx context.Context, prefix string) []string {
+	prefix = strings.TrimSpace(prefix)
+	items := []string{}
+	if prefix == "" {
+		return items
+	}
+	seen := map[string]bool{}
+	rows, err := s.db.QueryContext(ctx, `SELECT query FROM query_logs
+		WHERE query LIKE ? AND CHAR_LENGTH(query) <= 40
+		GROUP BY query ORDER BY COUNT(*) DESC LIMIT 10`, prefix+"%")
+	if err == nil {
+		for rows.Next() {
+			var t string
+			if rows.Scan(&t) == nil && !seen[t] {
+				seen[t] = true
+				items = append(items, t)
+			}
+		}
+		rows.Close()
+	}
+	if len(items) < 8 {
+		rows, err := s.db.QueryContext(ctx, `SELECT term FROM terms
+			WHERE term LIKE ? ORDER BY df DESC LIMIT 10`, prefix+"%")
+		if err == nil {
+			for rows.Next() {
+				var t string
+				if rows.Scan(&t) == nil && !seen[t] {
+					seen[t] = true
+					items = append(items, t)
+				}
+			}
+			rows.Close()
+		}
+	}
+	if len(items) > 10 {
+		items = items[:10]
+	}
+	return items
 }
 
 func (s *Server) startCrawl(ctx context.Context) error {

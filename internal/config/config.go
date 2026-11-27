@@ -67,6 +67,10 @@ type ClusterConfig struct {
 	IdentityFile string `yaml:"identity_file"`
 	// Token 加入令牌，仅用于首次 enroll
 	Token string `yaml:"token"`
+	// ShardDocsPerNode 单节点期望承载的文档数，超过则把该域名拆成多个分片
+	ShardDocsPerNode int `yaml:"shard_docs_per_node"`
+	// AutoShard 是否按文档量自动调整分片
+	AutoShard bool `yaml:"auto_shard"`
 	// Version 由主程序写入，随注册上报
 	Version string `yaml:"-"`
 }
@@ -154,6 +158,7 @@ func defaults() *Config {
 		Cluster: ClusterConfig{
 			Role: "standalone", NodeID: "node-local", NodeName: "本地节点", Weight: 1, HeartbeatSec: 10,
 			FanoutMode: "all", ReplicaFactor: 1, RequireAuth: true, IdentityFile: "data/node_identity.json",
+			ShardDocsPerNode: 20000, AutoShard: true,
 		},
 		Crawler: CrawlerConfig{
 			Enabled: true, Mode: "targeted", TimeoutSec: 15, MaxDepth: 2, MaxPagesPerRun: 200,

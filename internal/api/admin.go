@@ -56,8 +56,16 @@ func (s *Server) routeAdmin(w http.ResponseWriter, r *http.Request, sub string) 
 		s.aConfig(w, r)
 	case "assignments":
 		s.aAssignments(w, r)
+	case "assign/rebalance":
+		s.aRebalance(w, r)
+	case "assign/move":
+		s.aAssignMove(w, r)
+	case "shards":
+		s.aShards(w, r)
 	case "hot":
 		s.aHot(w, r)
+	case "suggest":
+		s.aSuggest(w, r)
 	case "search":
 		s.aSearch(w, r)
 	case "query-logs":
@@ -74,6 +82,14 @@ func (s *Server) aOverview(w http.ResponseWriter, r *http.Request) {
 	s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT domain) FROM documents`).Scan(&domains)
 	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM crawl_logs WHERE created_at >= CURDATE()`).Scan(&todayFetched)
 	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM query_logs WHERE created_at >= CURDATE()`).Scan(&todayQueries)
+
+	// 检索质量指标：今日查询、平均/慢查询耗时、零结果查询占比
+	var avgLat, p95Lat, zeroHit int64
+	s.db.QueryRowContext(ctx, `SELECT CAST(COALESCE(AVG(latency_ms),0) AS SIGNED) FROM query_logs
+		WHERE created_at >= CURDATE()`).Scan(&avgLat)
+	s.db.QueryRowContext(ctx, `SELECT CAST(COALESCE(MAX(latency_ms),0) AS SIGNED) FROM query_logs
+		WHERE created_at >= CURDATE()`).Scan(&p95Lat)
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM query_logs WHERE created_at >= CURDATE() AND results=0`).Scan(&zeroHit)
 
 	queue := s.crawler.Frontier().Stats(ctx)
 	nodes := s.master.ListNodes()
@@ -100,6 +116,10 @@ func (s *Server) aOverview(w http.ResponseWriter, r *http.Request) {
 		"node_id":       s.cfg.Cluster.NodeID,
 		"uptime":        fmtDuration(time.Since(s.startAt)),
 		"search_mode":   searchMode(s.cfg),
+		"query_avg_ms":  avgLat,
+		"query_max_ms":  p95Lat,
+		"query_zero":    zeroHit,
+		"shards":        s.master.ShardPolicies(ctx),
 	})
 }
 
@@ -111,12 +131,27 @@ func searchMode(c *config.Config) string {
 }
 
 func (s *Server) aNodes(w http.ResponseWriter, r *http.Request) {
+	// 每个节点承载的分片数：后台卡片上直接能看到分配是否均衡
+	counts := map[string]int{}
+	for _, a := range s.master.Assignments() {
+		if a.Role == "primary" {
+			counts[a.NodeID]++
+		}
+	}
 	writeJSON(w, 200, map[string]interface{}{
 		"nodes":          s.master.ListNodes(),
 		"self_id":        s.cfg.Cluster.NodeID,
 		"replica_factor": s.cfg.Cluster.ReplicaFactor,
 		"require_auth":   s.cfg.Cluster.RequireAuth,
 		"join_bases":     s.joinBases(),
+		"primary_counts": counts,
+	})
+}
+
+// aSuggest 搜索建议：按词项前缀补全，用于搜索框下拉。
+func (s *Server) aSuggest(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{
+		"items": s.suggest(r.Context(), r.URL.Query().Get("q")),
 	})
 }
 
@@ -410,49 +445,46 @@ func (s *Server) aCrawlLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) aDocs(w http.ResponseWriter, r *http.Request) {
-	page := atoiDefault(r.URL.Query().Get("page"), 1)
-	size := atoiDefault(r.URL.Query().Get("size"), 20)
+	q := r.URL.Query()
+	nodeID := strings.TrimSpace(q.Get("node_id"))
+	page := atoiDefault(q.Get("page"), 1)
+	size := atoiDefault(q.Get("size"), 20)
 	if page < 1 {
 		page = 1
 	}
-	if size < 1 || size > 100 {
+	if size < 1 || size > 200 {
 		size = 20
 	}
-	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	where := ""
-	args := []interface{}{}
-	if q != "" {
-		where = " WHERE title LIKE ? OR domain LIKE ?"
-		args = append(args, "%"+q+"%", "%"+q+"%")
+	shard := atoiDefault(q.Get("shard"), -1)
+	dq := store.DocQuery{
+		Page:   page,
+		Size:   size,
+		Q:      strings.TrimSpace(q.Get("q")),
+		Domain: strings.TrimSpace(q.Get("domain")),
+		Shard:  shard,
 	}
-	var total int64
-	s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM documents`+where, args...).Scan(&total)
-	args = append(args, size, (page-1)*size)
-	rows, err := s.db.QueryContext(r.Context(), `SELECT id,url,title,domain,content_len,http_status,fetched_at,
-		site_weight,dynamic_weight,trust_score,spam_score,index_status
-		FROM documents`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`, args...)
+	res, err := s.master.NodeDocs(r.Context(), nodeID, dq)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 502, "读取节点文档失败: "+err.Error())
 		return
 	}
-	defer rows.Close()
-	var out []map[string]interface{}
-	for rows.Next() {
-		var id, clen int64
-		var url, title, domain string
-		var status, ist int
-		var fetched time.Time
-		var site, dyn, trust, spam float64
-		if rows.Scan(&id, &url, &title, &domain, &clen, &status, &fetched, &site, &dyn, &trust, &spam, &ist) == nil {
-			out = append(out, map[string]interface{}{
-				"id": id, "url": url, "title": title, "domain": domain, "content_len": clen,
-				"http_status": status, "fetched_at": fetched.Format("2006-01-02 15:04"),
-				"site_weight": site, "dynamic_weight": dyn, "trust_score": trust, "spam_score": spam,
-				"index_status": ist,
-			})
-		}
+	writeJSON(w, 200, map[string]interface{}{
+		"node_id":     nodeID,
+		"docs":        res.Docs,
+		"total":       res.Total,
+		"page":        page,
+		"size":        size,
+		"pages":       pagesOf(res.Total, size),
+		"stats":       res.Stats,
+		"top_domains": res.TopDomains,
+	})
+}
+
+func pagesOf(total int64, size int) int {
+	if size <= 0 || total <= 0 {
+		return 0
 	}
-	writeJSON(w, 200, map[string]interface{}{"docs": out, "total": total, "page": page, "size": size})
+	return int((total + int64(size) - 1) / int64(size))
 }
 
 func (s *Server) aKeys(w http.ResponseWriter, r *http.Request) {
@@ -540,7 +572,76 @@ func (s *Server) configSnapshot() map[string]interface{} {
 }
 
 func (s *Server) aAssignments(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]interface{}{"assignments": s.master.Assignments()})
+	list := s.master.Assignments()
+	// 汇总每个节点承载的分片数，后台直接看是否均衡
+	counts := map[string]int{}
+	for _, a := range list {
+		if a.Role == "primary" {
+			counts[a.NodeID]++
+		}
+	}
+	writeJSON(w, 200, map[string]interface{}{"assignments": list, "primary_counts": counts})
+}
+
+// aRebalance 按节点权重重算分配：权重越高，分到的域名分片越多。
+func (s *Server) aRebalance(w http.ResponseWriter, r *http.Request) {
+	moved := s.master.Rebalance()
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "moved": moved,
+		"note": "已按权重把超载节点上的分片搬到低载节点"})
+}
+
+// aAssignMove 手动把某个 (域名, 分片) 的主副本指定到节点。
+func (s *Server) aAssignMove(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Domain string `json:"domain"`
+		Shard  int    `json:"shard"`
+		NodeID string `json:"node_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Domain == "" || body.NodeID == "" {
+		writeErr(w, 400, "参数错误")
+		return
+	}
+	if err := s.master.MoveRoute(body.Domain, body.Shard, body.NodeID); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+// aShards 分片策略：GET 列表，POST 调整某域名的分片数。
+func (s *Server) aShards(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		var body struct {
+			Domain string `json:"domain"`
+			Shards int    `json:"shards"`
+			Auto   bool   `json:"auto"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, 400, "参数错误")
+			return
+		}
+		if body.Auto {
+			n := 0
+			if body.Shards > 0 {
+				n = s.master.EnsureAutoShards(body.Shards)
+			} else {
+				n = s.master.EnsureAutoShards(s.cfg.Cluster.ShardDocsPerNode)
+			}
+			writeJSON(w, 200, map[string]interface{}{"ok": true, "adjusted": n})
+			return
+		}
+		if body.Domain == "" {
+			writeErr(w, 400, "缺少 domain")
+			return
+		}
+		if err := s.master.SetShards(body.Domain, body.Shards); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]interface{}{"ok": true, "domain": body.Domain, "shards": body.Shards})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"shards": s.master.ShardPolicies(r.Context())})
 }
 
 func (s *Server) aHot(w http.ResponseWriter, r *http.Request) {
@@ -565,21 +666,44 @@ func (s *Server) hotQueries(ctx context.Context, n int) []map[string]interface{}
 
 func (s *Server) aSearch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Query string `json:"query"`
-		TopK  int    `json:"top_k"`
+		Query  string `json:"query"`
+		TopK   int    `json:"top_k"`
+		Size   int    `json:"size"`
+		Page   int    `json:"page"`
+		Offset int    `json:"offset"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "参数错误")
 		return
 	}
-	if body.TopK <= 0 {
-		body.TopK = s.cfg.Search.TopK
+	size := body.Size
+	if size <= 0 {
+		size = body.TopK
 	}
-	res, err := s.master.Search(r.Context(), body.Query, body.TopK)
+	if size <= 0 {
+		size = s.cfg.Search.TopK
+	}
+	if size > 100 {
+		size = 100
+	}
+	page := body.Page
+	if page < 1 {
+		page = 1
+	}
+	offset := 0
+	if body.Offset > 0 {
+		// 显式指定 offset 时以它为准
+		offset = body.Offset
+		page = offset/size + 1
+	} else {
+		offset = (page - 1) * size
+	}
+	res, err := s.master.Search(r.Context(), body.Query, size, offset)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	res.Paginate(page, size)
 	writeJSON(w, 200, res)
 }
 

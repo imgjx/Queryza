@@ -42,8 +42,28 @@ type Result struct {
 	Hits   []store.SearchHit `json:"hits"`
 	Cached bool              `json:"cached"`
 	NodeID string            `json:"node_id"`
+	// 分页元信息：page 从 1 开始，pages 为总页数（total 为真实召回量）
+	Page  int `json:"page"`
+	Size  int `json:"size"`
+	Pages int `json:"pages"`
 	// Degraded 记录本次检索失败的节点，便于观察集群健康
 	Degraded []string `json:"degraded,omitempty"`
+}
+
+// Paginate 按 page/size 设置分页元信息（不修改 Hits）。
+func (r *Result) Paginate(page, size int) {
+	if size <= 0 {
+		size = 10
+	}
+	if page <= 0 {
+		page = 1
+	}
+	r.Page, r.Size = page, size
+	if r.Total <= 0 {
+		r.Pages = 0
+	} else {
+		r.Pages = (r.Total + size - 1) / size
+	}
 }
 
 func (s *Searcher) SearchLocal(ctx context.Context, query string, topK int) (*Result, error) {

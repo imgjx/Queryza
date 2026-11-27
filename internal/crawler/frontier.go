@@ -17,6 +17,7 @@ type Task struct {
 	URL      string
 	URLHash  string
 	Domain   string
+	Shard    int
 	Depth    int
 	Priority int
 }
@@ -117,17 +118,17 @@ func (f *Frontier) Enqueue(ctx context.Context, tasks []Task) (int, error) {
 		batch := tasks[start:end]
 		var sb strings.Builder
 		sb.Grow(len(batch) * 24)
-		sb.WriteString(`INSERT IGNORE INTO crawl_queue(url,url_hash,domain,depth,priority,status,node_id) VALUES `)
-		args := make([]interface{}, 0, len(batch)*5)
+		sb.WriteString(`INSERT IGNORE INTO crawl_queue(url,url_hash,domain,shard,depth,priority,status,node_id) VALUES `)
+		args := make([]interface{}, 0, len(batch)*6)
 		for i, t := range batch {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
-			sb.WriteString(`(?,?,?,?,?,'pending','')`)
+			sb.WriteString(`(?,?,?,?,?,?,'pending','')`)
 			if t.URLHash == "" {
 				t.URLHash = URLHash(t.URL)
 			}
-			args = append(args, t.URL, t.URLHash, t.Domain, t.Depth, t.Priority)
+			args = append(args, t.URL, t.URLHash, t.Domain, t.Shard, t.Depth, t.Priority)
 		}
 		r, err := f.db.ExecContext(ctx, sb.String(), args...)
 		if err != nil {
@@ -196,7 +197,7 @@ func (f *Frontier) leaseFrom(ctx context.Context, after string, n int) ([]Task, 
 		return nil, err
 	}
 	defer tx.Rollback()
-	q := `SELECT id,url,url_hash,domain,depth,priority FROM crawl_queue WHERE status='pending'`
+	q := `SELECT id,url,url_hash,domain,shard,depth,priority FROM crawl_queue WHERE status='pending'`
 	var args []interface{}
 	if len(f.domains) > 0 && len(f.domains) <= 800 {
 		q += ` AND domain IN (` + placeholders(len(f.domains)) + `)`
@@ -218,7 +219,7 @@ func (f *Frontier) leaseFrom(ctx context.Context, after string, n int) ([]Task, 
 	var tasks []Task
 	for rows.Next() {
 		var t Task
-		if err := rows.Scan(&t.ID, &t.URL, &t.URLHash, &t.Domain, &t.Depth, &t.Priority); err == nil {
+		if err := rows.Scan(&t.ID, &t.URL, &t.URLHash, &t.Domain, &t.Shard, &t.Depth, &t.Priority); err == nil {
 			tasks = append(tasks, t)
 		}
 	}

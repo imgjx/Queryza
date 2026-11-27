@@ -26,10 +26,12 @@ cluster:
   master_addr: ""
   master_addrs: []
   advertise_addr: ""
-  weight: 1
+  weight: 1               # 节点权重＝它能承载多少内容，权重越高分到的域名分片越多
   heartbeat_sec: 10
   fanout_mode: all
   replica_factor: 1       # 每个域名在几个节点上各存一份；检索只走主副本
+  shard_docs_per_node: 20000  # 单节点期望承载的文档数，超过就把该域名拆成多个分片
+  auto_shard: true        # 是否按文档量自动调整分片
   require_auth: true      # 节点内部接口强制 HMAC 签名
   identity_file: data/node_identity.json
   token: ""               # 加入令牌，仅首次加入时通过 -token 传入

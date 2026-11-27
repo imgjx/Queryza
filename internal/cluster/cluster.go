@@ -28,6 +28,26 @@ type InternalSearchReq struct {
 	Domains []string `json:"domains,omitempty"`
 }
 
+// InternalDocsReq 主节点向子节点拉取文档库分页数据。
+type InternalDocsReq struct {
+	Page   int    `json:"page"`
+	Size   int    `json:"size"`
+	Q      string `json:"q"`
+	Domain string `json:"domain"`
+	Shard  *int   `json:"shard"` // nil 表示不限分片
+}
+
+type InternalDocsResp struct {
+	OK         bool                 `json:"ok"`
+	Err        string               `json:"err"`
+	Docs       []store.DocRow       `json:"docs"`
+	Total      int64                `json:"total"`
+	Page       int                  `json:"page"`
+	Size       int                  `json:"size"`
+	Stats      *store.DocStats      `json:"stats"`
+	TopDomains []store.DomainCount  `json:"top_domains"`
+}
+
 type InternalSearchResp struct {
 	OK     bool           `json:"ok"`
 	Err    string         `json:"err"`
@@ -69,6 +89,11 @@ type Master struct {
 	// 必须走内存，不能每次查库（曾是最严重的串行点）。
 	asgMu    sync.RWMutex
 	asgCache map[string]*asgEntry
+
+	// 域名分片数缓存
+	shardMu sync.RWMutex
+	shards  map[string]int
+	shardAt time.Time
 	assignMu sync.Mutex
 
 	domMu   sync.Mutex
@@ -327,129 +352,6 @@ func (m *Master) OnlineNodes() []store.Node {
 
 // ---------- 域名分配（多副本） ----------
 
-func (m *Master) assignmentCounts() map[string]int {
-	out := map[string]int{}
-	rows, err := m.db.Query(`SELECT node_id, COUNT(*) FROM domain_replicas WHERE role='primary' GROUP BY node_id`)
-	if err != nil {
-		return out
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		var c int
-		if rows.Scan(&id, &c) == nil {
-			out[id] = c
-		}
-	}
-	return out
-}
-
-// AssignDomain 返回域名的主副本节点，不存在则按「已分配域名最少优先」新建副本组。
-// 结果走内存缓存（正缓存 120s / 负缓存 5s）：抓取时每条 URL 都要判定归属，
-// 之前每页一次 DB 查询并持有全局锁，是整条抓取链路的串行瓶颈。
-func (m *Master) AssignDomain(domain string) string {
-	if domain == "" {
-		return ""
-	}
-	m.asgMu.RLock()
-	e := m.asgCache[domain]
-	m.asgMu.RUnlock()
-	if e != nil && time.Since(e.at) < e.ttl {
-		return e.primary
-	}
-
-	m.assignMu.Lock()
-	// 双重检查：并发 miss 时只放一个 goroutine 去查库/分配
-	m.asgMu.RLock()
-	e = m.asgCache[domain]
-	m.asgMu.RUnlock()
-	if e != nil && time.Since(e.at) < e.ttl {
-		m.assignMu.Unlock()
-		return e.primary
-	}
-	primary, created := m.lookupOrAssign(domain)
-	m.assignMu.Unlock()
-
-	ttl := 120 * time.Second
-	if primary == "" {
-		ttl = 5 * time.Second // 暂无在线节点，短暂负缓存，等节点上线
-	}
-	m.asgMu.Lock()
-	if len(m.asgCache) > 200000 {
-		now := time.Now()
-		for k, v := range m.asgCache {
-			if now.Sub(v.at) >= v.ttl {
-				delete(m.asgCache, k)
-			}
-		}
-	}
-	m.asgCache[domain] = &asgEntry{primary: primary, at: time.Now(), ttl: ttl}
-	m.asgMu.Unlock()
-
-	if created {
-		// 只让「节点 → 域名列表」缓存过期。
-		// 原来调用 invalidateDomains 会连 asgCache 一起清空，
-		// 而抓取时每发现一个新域名就会触发一次，导致已有域名的归属缓存
-		// 被反复清掉、每个页面都要回查数据库。新域名不影响老域名的归属。
-		m.invalidateDomainList()
-	}
-	return primary
-}
-
-// lookupOrAssign 查库或新建副本组；调用方需持有 assignMu。
-func (m *Master) lookupOrAssign(domain string) (string, bool) {
-	var primary string
-	rows, err := m.db.Query(`SELECT node_id,role FROM domain_replicas WHERE domain=?`, domain)
-	if err == nil {
-		for rows.Next() {
-			var id, role string
-			if rows.Scan(&id, &role) == nil && role == "primary" {
-				primary = id
-			}
-		}
-		rows.Close()
-	}
-	if primary != "" {
-		return primary, false
-	}
-
-	nodes := m.OnlineNodes()
-	if len(nodes) == 0 {
-		return "", false
-	}
-	counts := m.assignmentCounts()
-	sort.SliceStable(nodes, func(i, j int) bool {
-		ci, cj := counts[nodes[i].NodeID], counts[nodes[j].NodeID]
-		if ci != cj {
-			return ci < cj
-		}
-		return nodes[i].NodeID < nodes[j].NodeID
-	})
-
-	factor := m.cfg.Cluster.ReplicaFactor
-	if factor <= 0 {
-		factor = 1
-	}
-	if factor > len(nodes) {
-		factor = len(nodes)
-	}
-	primary = nodes[0].NodeID
-	m.db.Exec(`INSERT IGNORE INTO domain_replicas(domain,node_id,role,weight) VALUES(?,?,'primary',1)`, domain, primary)
-	for i := 1; i < factor; i++ {
-		m.db.Exec(`INSERT IGNORE INTO domain_replicas(domain,node_id,role,weight) VALUES(?,?,'replica',1)`, domain, nodes[i].NodeID)
-	}
-	return primary, true
-}
-
-// OwnDomain 判断本节点是否为该域名的主副本（抓取与入库由主副本负责）。
-func (m *Master) OwnDomain(domain string) bool {
-	primary := m.AssignDomain(domain)
-	if primary == "" {
-		return true
-	}
-	return primary == m.cfg.Cluster.NodeID
-}
-
 // OwnedDomains 返回本节点负责的域名，供抓取队列过滤。
 func (m *Master) OwnedDomains() []string { return m.DomainsOf(m.cfg.Cluster.NodeID) }
 
@@ -474,11 +376,20 @@ func (m *Master) DomainsOf(nodeID string) []string {
 	defer m.domMu.Unlock()
 	if m.domains == nil || time.Since(m.domAt) > 5*time.Second {
 		next := map[string][]string{}
+		seen := map[string]map[string]bool{}
 		rows, err := m.db.Query(`SELECT node_id,domain FROM domain_replicas WHERE role='primary'`)
 		if err == nil {
 			for rows.Next() {
 				var id, d string
 				if rows.Scan(&id, &d) == nil {
+					// 同一域名的多个分片可能落在同一节点，列表里只保留一次
+					if seen[id] == nil {
+						seen[id] = map[string]bool{}
+					}
+					if seen[id][d] {
+						continue
+					}
+					seen[id][d] = true
 					next[id] = append(next[id], d)
 				}
 			}
@@ -517,111 +428,6 @@ func (m *Master) SearchNodes() []store.Node {
 		return online
 	}
 	return out
-}
-
-// Rebalance 在新节点加入后把主副本域名从最忙的节点挪一部分给最闲的节点。
-func (m *Master) Rebalance() int {
-	nodes := m.OnlineNodes()
-	if len(nodes) < 2 {
-		return 0
-	}
-	counts := m.assignmentCounts()
-	type dom struct{ domain, node string }
-	rows, err := m.db.Query(`SELECT domain,node_id FROM domain_replicas WHERE role='primary'`)
-	if err != nil {
-		return 0
-	}
-	var list []dom
-	for rows.Next() {
-		var d dom
-		if rows.Scan(&d.domain, &d.node) == nil {
-			list = append(list, d)
-		}
-	}
-	rows.Close()
-	if len(list) < len(nodes) {
-		return 0
-	}
-
-	online := map[string]bool{}
-	for _, n := range nodes {
-		online[n.NodeID] = true
-		if _, ok := counts[n.NodeID]; !ok {
-			counts[n.NodeID] = 0
-		}
-	}
-
-	// ① 先把副本数不足的域名补齐，保证主副本挂掉时有节点可接管
-	if factor := m.cfg.Cluster.ReplicaFactor; factor > 1 {
-		type grp struct {
-			domains []string
-		}
-		_ = grp{}
-		rows, err := m.db.Query(`SELECT domain,node_id FROM domain_replicas`)
-		if err == nil {
-			have := map[string]map[string]bool{}
-			for rows.Next() {
-				var d, n string
-				if rows.Scan(&d, &n) == nil {
-					if have[d] == nil {
-						have[d] = map[string]bool{}
-					}
-					have[d][n] = true
-				}
-			}
-			rows.Close()
-			for d, set := range have {
-				if len(set) >= factor {
-					continue
-				}
-				for _, n := range nodes {
-					if len(set) >= factor {
-						break
-					}
-					if set[n.NodeID] {
-						continue
-					}
-					m.db.Exec(`INSERT INTO domain_replicas(domain,node_id,role,weight) VALUES(?,?,'replica',1)
-						ON DUPLICATE KEY UPDATE role=VALUES(role)`, d, n.NodeID)
-					set[n.NodeID] = true
-					counts[n.NodeID]++
-				}
-			}
-		}
-	}
-
-	moved := 0
-	for _, d := range list {
-		hi, lo := "", ""
-		hiC, loC := -1, 1<<30
-		for id, c := range counts {
-			if !online[id] {
-				continue
-			}
-			if c > hiC {
-				hi, hiC = id, c
-			}
-			if c < loC {
-				lo, loC = id, c
-			}
-		}
-		if hi == "" || lo == "" || hiC-loC <= 1 || d.node != hi {
-			continue
-		}
-		m.db.Exec(`UPDATE domain_replicas SET role='replica' WHERE domain=? AND node_id=?`, d.domain, hi)
-		m.db.Exec(`INSERT INTO domain_replicas(domain,node_id,role,weight) VALUES(?,?,'primary',1)
-			ON DUPLICATE KEY UPDATE role='primary'`, d.domain, lo)
-		counts[hi]--
-		counts[lo]++
-		moved++
-		if moved >= len(nodes)*4 {
-			break
-		}
-	}
-	if moved > 0 {
-		m.invalidateDomains()
-	}
-	return moved
 }
 
 // BackfillAssignments 为已有文档的域名补建副本分配（启动时调用）。
@@ -699,7 +505,8 @@ func (m *Master) Promote() {
 }
 
 func (m *Master) Assignments() []store.DomainAssignment {
-	rows, err := m.db.Query(`SELECT domain,node_id,role,weight FROM domain_replicas ORDER BY domain,role DESC`)
+	rows, err := m.db.Query(`SELECT domain,shard,node_id,role,weight FROM domain_replicas
+		ORDER BY domain,shard,role DESC`)
 	if err != nil {
 		return nil
 	}
@@ -707,7 +514,7 @@ func (m *Master) Assignments() []store.DomainAssignment {
 	var out []store.DomainAssignment
 	for rows.Next() {
 		var a store.DomainAssignment
-		if rows.Scan(&a.Domain, &a.NodeID, &a.Role, &a.Weight) == nil {
+		if rows.Scan(&a.Domain, &a.Shard, &a.NodeID, &a.Role, &a.Weight) == nil {
 			out = append(out, a)
 		}
 	}
@@ -723,15 +530,22 @@ type nodeResult struct {
 }
 
 // Search 向「主副本节点」fan-out，合并后去重。
-func (m *Master) Search(ctx context.Context, query string, topK int) (*search.Result, error) {
+func (m *Master) Search(ctx context.Context, query string, topK, offset int) (*search.Result, error) {
 	start := time.Now()
+	if offset < 0 {
+		offset = 0
+	}
+	// 各节点都要多返回 offset 条，才能在合并排序后切出第 N 页
+	ask := topK + offset
 	nodes := m.SearchNodes()
 	if len(nodes) == 0 {
-		return m.local.SearchLocal(ctx, query, topK)
+		r, err := m.local.SearchLocal(ctx, query, ask)
+		return sliceResult(r, topK, offset), err
 	}
 	// 单节点直接走本地，保留原始 BM25 分与分词结果
 	if len(nodes) == 1 && nodes[0].NodeID == m.cfg.Cluster.NodeID {
-		return m.local.SearchLocal(ctx, query, topK)
+		r, err := m.local.SearchLocal(ctx, query, ask)
+		return sliceResult(r, topK, offset), err
 	}
 
 	results := make([]nodeResult, len(nodes))
@@ -742,11 +556,11 @@ func (m *Master) Search(ctx context.Context, query string, topK int) (*search.Re
 			defer wg.Done()
 			if n.NodeID == m.cfg.Cluster.NodeID {
 				allow := m.domainSet(m.DomainsOf(n.NodeID))
-				r, err := m.local.SearchLocalWithin(ctx, query, topK, allow)
+				r, err := m.local.SearchLocalWithin(ctx, query, ask, allow)
 				results[i] = nodeResult{node: n, res: r, err: err}
 				return
 			}
-			r, err := m.remoteSearch(ctx, n, query, topK)
+			r, err := m.remoteSearch(ctx, n, query, ask)
 			results[i] = nodeResult{node: n, res: r, err: err}
 		}(i, n)
 	}
@@ -761,7 +575,7 @@ func (m *Master) Search(ctx context.Context, query string, topK int) (*search.Re
 		}
 		if nr.err != nil {
 			// 主副本不可达：找一个持有该域名副本的在线节点代查
-			if r, via, err := m.replicaSearch(ctx, nr.node.NodeID, query, topK); err == nil && r != nil {
+			if r, via, err := m.replicaSearch(ctx, nr.node.NodeID, query, ask); err == nil && r != nil {
 				nr.res, nr.node.NodeID, nr.node.Weight = r, via.NodeID, via.Weight
 				if len(tokens) == 0 && len(r.Tokens) > 0 {
 					tokens = r.Tokens
@@ -793,8 +607,13 @@ func (m *Master) Search(ctx context.Context, query string, topK int) (*search.Re
 	}
 	sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
 	total := len(hits)
-	if topK > 0 && len(hits) > topK {
-		hits = hits[:topK]
+	if offset >= len(hits) {
+		hits = []store.SearchHit{}
+	} else {
+		hits = hits[offset:]
+		if topK > 0 && len(hits) > topK {
+			hits = hits[:topK]
+		}
 	}
 	res := &search.Result{
 		Query: query, Tokens: tokens, Mode: "cluster", Total: total,
@@ -869,6 +688,79 @@ func (m *Master) replicaSearch(ctx context.Context, failedNode, query string, to
 	}
 	r, err := m.remoteSearchDomains(ctx, *target, query, topK, domains)
 	return r, *target, err
+}
+
+// NodeDocs 拉取指定节点的文档库分页数据；nodeID 为空或本节点时直接查本地库。
+func (m *Master) NodeDocs(ctx context.Context, nodeID string, q store.DocQuery) (*InternalDocsResp, error) {
+	if nodeID == "" || nodeID == m.cfg.Cluster.NodeID {
+		docs, total, err := m.db.QueryDocs(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		st := m.db.Stats(ctx)
+		return &InternalDocsResp{
+			OK: true, Docs: docs, Total: total, Page: q.Page, Size: q.Size,
+			Stats: &st, TopDomains: m.db.TopDomains(ctx, 12),
+		}, nil
+	}
+
+	m.mu.RLock()
+	node := m.nodes[nodeID]
+	m.mu.RUnlock()
+	if node == nil {
+		return nil, errors.New("节点不存在")
+	}
+	if node.Secret == "" {
+		return nil, errors.New("节点未持有密钥")
+	}
+	var shard *int
+	if q.Shard >= 0 {
+		v := q.Shard
+		shard = &v
+	}
+	body, _ := json.Marshal(InternalDocsReq{Page: q.Page, Size: q.Size, Q: q.Q, Domain: q.Domain, Shard: shard})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(node.Addr, "/internal/docs"), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	SignRequest(req, m.cfg.Cluster.Secret, m.cfg.Cluster.NodeID, body)
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("节点返回 %d", resp.StatusCode)
+	}
+	var ir InternalDocsResp
+	if err := json.Unmarshal(b, &ir); err != nil {
+		return nil, err
+	}
+	if !ir.OK {
+		return nil, fmt.Errorf("节点错误: %s", ir.Err)
+	}
+	return &ir, nil
+}
+
+// sliceResult 从已按分数排序的结果里切出第 N 页（本地路径用）。
+func sliceResult(r *search.Result, topK, offset int) *search.Result {
+	if r == nil {
+		return nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(r.Hits) {
+		r.Hits = []store.SearchHit{}
+		return r
+	}
+	r.Hits = r.Hits[offset:]
+	if topK > 0 && len(r.Hits) > topK {
+		r.Hits = r.Hits[:topK]
+	}
+	return r
 }
 
 func (m *Master) domainSet(list []string) map[string]bool {
@@ -1046,13 +938,26 @@ func (m *Master) StartMaintenance(ctx context.Context) {
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	tick := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			tick++
 			m.Promote()
-			m.Rebalance()
+			// 每 6 个心跳做一次再均衡：太频繁会在节点间来回搬分片
+			if tick%6 == 0 {
+				if n := m.Rebalance(); n > 0 {
+					log.Printf("分配再均衡：迁移 %d 个分片", n)
+				}
+			}
+			// 每 5 分钟按文档量检查一次是否需要加分片
+			if m.cfg.Cluster.AutoShard && tick%30 == 0 {
+				if n := m.EnsureAutoShards(m.cfg.Cluster.ShardDocsPerNode); n > 0 {
+					log.Printf("自动分片：调整了 %d 个域名", n)
+				}
+			}
 			m.refreshSelfCount(ctx)
 		}
 	}

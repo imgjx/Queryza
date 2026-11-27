@@ -111,14 +111,14 @@ func (ix *Indexer) indexOnce(ctx context.Context, doc *store.Document, tokens []
 	defer tx.Rollback()
 
 	res, err := tx.ExecContext(ctx, `INSERT INTO documents
-		(url,url_hash,domain,title,content,content_len,http_status,fetched_at,content_hash,simhash,
+		(url,url_hash,domain,shard,title,content,content_len,http_status,fetched_at,content_hash,simhash,
 		 site_weight,dynamic_weight,trust_score,spam_score,is_hot,index_status)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
 		ON DUPLICATE KEY UPDATE
 		 title=VALUES(title),content=VALUES(content),content_len=VALUES(content_len),
 		 http_status=VALUES(http_status),fetched_at=VALUES(fetched_at),content_hash=VALUES(content_hash),
-		 simhash=VALUES(simhash),site_weight=VALUES(site_weight),index_status=1,id=LAST_INSERT_ID(id)`,
-		doc.URL, doc.URLHash, doc.Domain, doc.Title, doc.Content, doc.ContentLen, doc.HTTPStatus,
+		 simhash=VALUES(simhash),site_weight=VALUES(site_weight),shard=VALUES(shard),index_status=1,id=LAST_INSERT_ID(id)`,
+		doc.URL, doc.URLHash, doc.Domain, doc.Shard, doc.Title, doc.Content, doc.ContentLen, doc.HTTPStatus,
 		doc.FetchedAt, doc.ContentHash, doc.SimHash, doc.SiteWeight, doc.DynamicWeight, doc.TrustScore, doc.SpamScore, doc.IsHot)
 	if err != nil {
 		return err

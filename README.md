@@ -170,7 +170,9 @@ make dist          # 生成 dist/queryza-<version>-linux-amd64.tar.gz
 - 查看索引规模、抓取进度、节点状态
 - 启动/停止抓取、手动入队 URL
 - 管理种子站点
-- 搜索测试（观察分词、BM25、向量分、来源）
+- 搜索测试（分词、BM25、向量分、来源、关键词高亮、分页、联想）
+- 文档库（按节点分组查看，服务端分页，不会一次拉全量）
+- 域名分配（按权重均衡、大域名分片、手动改派分片主副本）
 - 创建 API 密钥（配额/QPS/结果上限）
 - 修改检索权重与抓取配置
 
@@ -179,8 +181,21 @@ make dist          # 生成 dist/queryza-<version>-linux-amd64.tar.gz
 先在后台创建密钥，然后：
 
 ```bash
+# 第 1 页，每页 10 条
 curl -H "X-API-Key: qz_xxx" \
-  "http://127.0.0.1:8080/api/v1/search?q=搜索引擎&top_k=10"
+  "http://127.0.0.1:8080/api/v1/search?q=搜索引擎&page=1&size=10"
+
+# 也可以直接给 offset
+curl -H "X-API-Key: qz_xxx" \
+  "http://127.0.0.1:8080/api/v1/search?q=搜索引擎&size=10&offset=20"
+
+# POST 写法
+curl -X POST -H "X-API-Key: qz_xxx" -H "Content-Type: application/json" \
+  -d '{"query":"搜索引擎","page":2,"size":10}' \
+  http://127.0.0.1:8080/api/v1/search
+
+# 联想
+curl -H "X-API-Key: qz_xxx" "http://127.0.0.1:8080/api/v1/suggest?q=数据"
 ```
 
 响应：
@@ -190,7 +205,10 @@ curl -H "X-API-Key: qz_xxx" \
   "query": "搜索引擎",
   "tokens": ["搜索", "索引", "引擎"],
   "mode": "keyword",
-  "total": 12,
+  "total": 913,
+  "page": 1,
+  "size": 10,
+  "pages": 92,
   "took_ms": 3,
   "hits": [
     {"doc_id":1,"url":"...","title":"...","domain":"...","snippet":"...",
@@ -198,6 +216,9 @@ curl -H "X-API-Key: qz_xxx" \
   ]
 }
 ```
+
+`total` 是倒排真实召回量；`pages` 按 `size` 算好，直接拿来渲染分页条即可。
+`top_k` 仍作为 `size` 的别名兼容旧调用。
 
 ### 3. 集群部署
 
@@ -227,6 +248,15 @@ curl -H "X-API-Key: qz_xxx" \
 
 **主地址表**按顺序尝试：前面的是 CDN 入口，最后可以放直连 IP；某个入口不通就自动切下一个，
 每分钟回到表首重试（CDN 套餐恢复后会自动切回去）。
+
+**按权重分配**：节点权重表示它能承载多少内容。分配时选「已承载分片数 / 权重」最小的节点，
+所以权重 2 的节点会分到大约两倍的分片。后台「域名分配 → 按权重均衡」可立刻重算，
+之后每 6 个心跳也会自动校正一次。
+
+**大域名分片**：单个域名文档量太大时（例如论坛、聚合站），可以把它拆成 1/2/4/8 个分片，
+每个分片独立选主副本节点，URL 按哈希落到其中一个。检索照常 fan-out，结果按 URL 去重，
+对调用方完全透明。`cluster.shard_docs_per_node`（默认 20000）控制自动拆片的阈值，
+后台也能对单个域名手动调整。注意：调大分片后已入库的文档不会迁移，需要重新抓一轮才会均匀。
 
 **多副本**：`-replica 2` 表示每个域名在两个节点各存一份。抓取由主副本负责，
 检索只问主副本；主副本挂掉时先由副本代查，心跳超时后副本自动提为主副本。

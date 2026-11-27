@@ -7,6 +7,7 @@ type Document struct {
 	URL           string    `json:"url"`
 	URLHash       string    `json:"url_hash"`
 	Domain        string    `json:"domain"`
+	Shard         int       `json:"shard"`
 	Title         string    `json:"title"`
 	Content       string    `json:"content"`
 	ContentLen    int       `json:"content_len"`
@@ -63,6 +64,7 @@ type DomainReplica struct {
 
 type DomainAssignment struct {
 	Domain string  `json:"domain"`
+	Shard  int     `json:"shard"`
 	NodeID string  `json:"node_id"`
 	Role   string  `json:"role"`
 	Weight float64 `json:"weight"`

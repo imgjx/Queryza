@@ -155,6 +155,10 @@ tbody tr:last-child td{border-bottom:none}
 .node-card .addr{font-size:11.5px;color:var(--muted);margin-top:3px}
 .node-metrics{display:flex;gap:22px;font-size:12.5px;color:var(--muted)}
 .node-metrics b{display:block;color:var(--text);font-size:16px;font-weight:700;margin-bottom:2px}
+.sug{position:absolute;top:calc(100% + 6px);left:0;right:0;background:#fff;border:1px solid var(--line);
+  border-radius:10px;box-shadow:0 10px 28px rgba(15,23,42,.12);z-index:20;overflow:hidden}
+.sug-item{padding:9px 14px;font-size:13px;cursor:pointer}
+.sug-item:hover{background:#eef2ff;color:#4338ca}
 .hit{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:12px;transition:.15s}
 .hit:hover{border-color:#c7d2fe;box-shadow:0 6px 20px rgba(99,102,241,.08)}
 .hit .t{font-size:15.5px;font-weight:600;color:#4338ca;margin-bottom:5px}
@@ -328,31 +332,51 @@ tbody tr:last-child td{border-bottom:none}
 
         <!-- 文档库 -->
         <section v-if="page==='docs'">
-          <div class="page-head"><div><h2>文档库</h2><p>已抓取并建立索引的页面</p></div></div>
-          <div class="toolbar">
-            <input class="input" v-model="docQuery" placeholder="搜索标题或域名…" @keyup.enter="loadDocs(1)">
+          <div class="page-head"><div><h2>文档库</h2><p>按节点查看已抓取并建立索引的页面</p></div></div>
+          <div class="toolbar" style="flex-wrap:wrap;gap:10px">
+            <select class="input" style="max-width:220px" v-model="docNode" @change="loadDocs(1)">
+              <option value="">本节点（{{ selfId }}）</option>
+              <option v-for="n in nodes.filter(x=>x.node_id!==selfId)" :key="n.node_id" :value="n.node_id">
+                {{ n.name || n.node_id }}{{ n.status==='online' ? '' : '（离线）' }}
+              </option>
+            </select>
+            <input class="input" style="max-width:240px" v-model="docQuery" placeholder="搜索标题、URL 或域名…" @keyup.enter="loadDocs(1)">
+            <select class="input" style="max-width:110px" v-model.number="docSize" @change="loadDocs(1)">
+              <option :value="20">20 条/页</option>
+              <option :value="50">50 条/页</option>
+              <option :value="100">100 条/页</option>
+            </select>
             <button class="btn" @click="loadDocs(1)">查询</button>
-            <span class="muted" style="font-size:12.5px">共 {{ fmt(docsData.total) }} 条</span>
+            <button class="btn" @click="loadDocs(docsData.page)" :disabled="docsLoading">刷新</button>
+          </div>
+          <div class="grid cards" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px" v-if="docsData.stats">
+            <div class="card stat"><div><div class="num">{{ fmt(docsData.stats.total) }}</div><div class="lbl">该节点文档</div></div></div>
+            <div class="card stat"><div><div class="num">{{ fmt(docsData.stats.domains) }}</div><div class="lbl">域名数</div></div></div>
+            <div class="card stat"><div><div class="num">{{ fmt(docsData.stats.today) }}</div><div class="lbl">今日新增</div></div></div>
+            <div class="card stat"><div><div class="num">{{ fmt(docsData.stats.avg_len) }}</div><div class="lbl">平均长度（词）</div></div></div>
           </div>
           <div class="panel">
             <table>
-              <thead><tr><th>标题</th><th>域名</th><th>长度</th><th>状态</th><th>抓取时间</th></tr></thead>
+              <thead><tr><th>标题</th><th>域名</th><th>分片</th><th>长度</th><th>状态</th><th>抓取时间</th></tr></thead>
               <tbody>
                 <tr v-for="d in docsData.docs" :key="d.id">
                   <td><span class="ellip" :title="d.title">{{ d.title || '(无标题)' }}</span>
                       <span class="ellip muted mono" style="font-size:11px;max-width:320px" :title="d.url">{{ d.url }}</span></td>
                   <td><span class="badge gray">{{ d.domain }}</span></td>
+                  <td class="mono">#{{ d.shard }}</td>
                   <td class="mono">{{ d.content_len }}</td>
                   <td><span class="badge" :class="d.http_status>=200&&d.http_status<400?'ok':'err'">{{ d.http_status }}</span></td>
                   <td class="muted" style="font-size:12px">{{ d.fetched_at }}</td>
                 </tr>
-                <tr v-if="!docsData.docs.length"><td colspan="5" class="empty">暂无文档</td></tr>
+                <tr v-if="!docsData.docs.length"><td colspan="6" class="empty">{{ docsLoading ? '加载中…' : '该节点没有文档' }}</td></tr>
               </tbody>
             </table>
             <div class="pager">
+              <button class="btn sm" @click="loadDocs(1)" :disabled="docsData.page<=1">首页</button>
               <button class="btn sm" @click="loadDocs(docsData.page-1)" :disabled="docsData.page<=1">上一页</button>
-              <span>第 {{ docsData.page }} 页 / 共 {{ Math.max(1,Math.ceil(docsData.total/docsData.size)) }} 页</span>
-              <button class="btn sm" @click="loadDocs(docsData.page+1)" :disabled="docsData.page*docsData.size>=docsData.total">下一页</button>
+              <span>第 {{ docsData.page }} / {{ Math.max(1, docsData.pages || Math.ceil(docsData.total/docSize)) }} 页 · 共 {{ fmt(docsData.total) }} 条</span>
+              <button class="btn sm" @click="loadDocs(docsData.page+1)" :disabled="docsData.page>=(docsData.pages||1)">下一页</button>
+              <button class="btn sm" @click="loadDocs(docsData.pages||1)" :disabled="docsData.page>=(docsData.pages||1)">末页</button>
             </div>
           </div>
         </section>
@@ -488,6 +512,7 @@ tbody tr:last-child td{border-bottom:none}
               </div>
               <div class="node-metrics">
                 <div><b>{{ fmt(n.doc_count) }}</b>文档</div>
+                <div><b>{{ (nodeMeta.primary_counts||{})[n.node_id] || 0 }}</b>分片</div>
                 <div><b>{{ n.weight }}</b>权重</div>
                 <div><b>{{ nodeCfg(n).concurrency || '—' }}</b>并发线程</div>
                 <div><b class="mono" style="font-size:12px">{{ n.last_ip || '—' }}</b>来源 IP</div>
@@ -505,21 +530,50 @@ tbody tr:last-child td{border-bottom:none}
 
         <!-- 域名分配 -->
         <section v-if="page==='assign'">
-          <div class="page-head"><div><h2>域名分配</h2><p>每个域名归属的抓取/存储节点</p></div>
-            <button class="btn" @click="loadAssign">刷新</button></div>
+          <div class="page-head">
+            <div><h2>域名分配</h2><p>按节点权重分配域名分片：权重越高承载越多，单个域名可拆到多个节点</p></div>
+            <div class="row" style="gap:8px">
+              <button class="btn" @click="doRebalance" :disabled="rebalancing">
+                <span v-if="rebalancing" class="spin"></span>按权重均衡
+              </button>
+              <button class="btn" @click="autoShard">自动分片</button>
+              <button class="btn" @click="loadAssign">刷新</button>
+            </div>
+          </div>
+          <div class="panel" style="margin-bottom:16px" v-if="shardPolicies.length">
+            <div style="padding:14px 16px 6px;font-weight:600;font-size:13.5px">分片策略（文档量前 200 的域名）</div>
+            <table>
+              <thead><tr><th>域名</th><th>文档数</th><th>当前分片</th><th>调整</th></tr></thead>
+              <tbody>
+                <tr v-for="x in shardPolicies" :key="x.domain">
+                  <td><span class="badge gray">{{ x.domain }}</span></td>
+                  <td class="mono">{{ fmt(x.docs) }}</td>
+                  <td class="mono">×{{ x.shards }}</td>
+                  <td>
+                    <div class="row" style="gap:6px">
+                      <button class="btn sm" v-for="n in [1,2,4,8]" :key="n" @click="setShards(x.domain,n)"
+                              :disabled="x.shards===n">{{ n }}</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
           <div class="panel">
             <table>
-              <thead><tr><th>域名</th><th>节点</th><th>角色</th><th>权重</th></tr></thead>
+              <thead><tr><th>域名</th><th>分片</th><th>节点</th><th>角色</th><th>操作</th></tr></thead>
               <tbody>
-                <tr v-for="a in assignments" :key="a.domain + a.node_id">
+                <tr v-for="a in assignments" :key="a.domain + '#' + a.shard + a.node_id">
                   <td><span class="badge gray">{{ a.domain }}</span></td>
+                  <td class="mono">#{{ a.shard }}</td>
                   <td class="mono">{{ a.node_id }}</td>
+                  <td><span class="badge" :class="a.role==='primary'?'ok':'gray'">{{ a.role==='primary'?'主副本':'副本' }}</span></td>
                   <td>
-                    <span class="badge" :class="a.role==='primary'?'ok':'gray'">{{ a.role==='primary'?'主副本':'副本' }}</span>
+                    <button v-if="a.role==='primary'" class="btn sm" @click="moveRoute(a)">改派</button>
+                    <span v-else class="muted">—</span>
                   </td>
-                  <td class="mono">{{ a.weight }}</td>
                 </tr>
-                <tr v-if="!assignments.length"><td colspan="4" class="empty">暂无分配记录（抓取时自动生成）</td></tr>
+                <tr v-if="!assignments.length"><td colspan="5" class="empty">暂无分配记录（抓取时自动生成）</td></tr>
               </tbody>
             </table>
           </div>
@@ -556,21 +610,34 @@ tbody tr:last-child td{border-bottom:none}
         <!-- 搜索测试 -->
         <section v-if="page==='search'">
           <div class="page-head"><div><h2>搜索测试</h2><p>直接调用检索链路，观察分词、召回与打分</p></div></div>
-          <div class="toolbar">
-            <input class="input" style="max-width:420px" v-model="searchQuery" placeholder="输入关键词，例如：搜索引擎 原理" @keyup.enter="doSearch">
-            <button class="btn primary" @click="doSearch" :disabled="searching">
+          <div class="toolbar" style="flex-wrap:wrap;gap:10px">
+            <div style="position:relative;flex:0 1 380px">
+              <input class="input" style="width:100%" v-model="searchQuery" placeholder="输入关键词，例如：搜索引擎 原理"
+                     @keyup.enter="doSearch(1)" @input="onQueryInput" @blur="hideSug" @focus="onQueryInput">
+              <div class="sug" v-if="showSug && sugItems.length">
+                <div class="sug-item" v-for="t in sugItems" :key="t" @mousedown.prevent="pickSug(t)">{{ t }}</div>
+              </div>
+            </div>
+            <select class="input" style="max-width:110px" v-model.number="searchSize" @change="doSearch(1)">
+              <option :value="10">10 条/页</option>
+              <option :value="20">20 条/页</option>
+              <option :value="50">50 条/页</option>
+            </select>
+            <button class="btn primary" @click="doSearch(1)" :disabled="searching">
               <span v-if="searching" class="spin"></span>搜索
             </button>
-            <span class="muted" style="font-size:12.5px" v-if="searchRes">{{ searchRes.total }} 条结果 · {{ searchRes.took_ms }}ms · {{ searchRes.mode }}</span>
+            <span class="muted" style="font-size:12.5px" v-if="searchRes">
+              {{ fmt(searchRes.total) }} 条结果 · 第 {{ searchRes.page || 1 }}/{{ Math.max(1, searchRes.pages || 1) }} 页 · {{ searchRes.took_ms }}ms · {{ searchRes.mode }}
+            </span>
           </div>
           <div v-if="searchRes && searchRes.tokens && searchRes.tokens.length" class="chips" style="margin-bottom:16px">
             <span class="chip" v-for="t in searchRes.tokens" :key="t">{{ t }}</span>
           </div>
           <div v-if="searchRes && searchRes.hits">
             <div class="hit" v-for="h in searchRes.hits" :key="h.url">
-              <div class="t">{{ h.title || '(无标题)' }}</div>
+              <div class="t" v-html="hl(h.title || '(无标题)')"></div>
               <div class="u">{{ h.url }}</div>
-              <div class="s">{{ h.snippet }}</div>
+              <div class="s" v-html="hl(h.snippet)"></div>
               <div class="meta">
                 <span>得分 <b>{{ Number(h.score).toFixed(4) }}</b></span>
                 <span>BM25 <b>{{ Number(h.bm25).toFixed(4) }}</b></span>
@@ -580,6 +647,13 @@ tbody tr:last-child td{border-bottom:none}
               </div>
             </div>
             <div v-if="!searchRes.hits.length" class="panel empty">没有匹配的文档</div>
+            <div class="pager" v-if="searchRes.total > 0">
+              <button class="btn sm" @click="doSearch(1)" :disabled="(searchRes.page||1)<=1">首页</button>
+              <button class="btn sm" @click="doSearch((searchRes.page||1)-1)" :disabled="(searchRes.page||1)<=1">上一页</button>
+              <span>第 {{ searchRes.page || 1 }} / {{ Math.max(1, searchRes.pages || 1) }} 页</span>
+              <button class="btn sm" @click="doSearch((searchRes.page||1)+1)" :disabled="(searchRes.page||1)>=(searchRes.pages||1)">下一页</button>
+              <button class="btn sm" @click="doSearch(searchRes.pages||1)" :disabled="(searchRes.page||1)>=(searchRes.pages||1)">末页</button>
+            </div>
           </div>
         </section>
 
@@ -876,7 +950,11 @@ createApp({
     const loginForm = reactive({username:'admin', password:''});
 
     const overview = ref({});
-    const docsData = ref({docs:[], total:0, page:1, size:20});
+    const docsData = ref({docs:[], total:0, page:1, pages:0, size:20, stats:null});
+    const docNode = ref('');
+    const docSize = ref(20);
+    const docsLoading = ref(false);
+    const selfId = computed(()=> nodeMeta.value.self_id || 'node-local');
     const docQuery = ref('');
     const seeds = ref([]);
     const hot = ref([]);
@@ -898,6 +976,11 @@ createApp({
     const searchQuery = ref('');
     const searchRes = ref(null);
     const searching = ref(false);
+    const searchSize = ref(20);
+    const shardPolicies = ref([]);
+    const rebalancing = ref(false);
+    const sugItems = ref([]);
+    const showSug = ref(false);
     const qLogs = ref([]);
     const config = ref({search:{}, limits:{}, crawler:{default_headers:{}}, embedding:{}, cluster:{}});
     const keys = ref([]);
@@ -978,8 +1061,16 @@ createApp({
 
     async function loadDocs(p){
       if(p<1) return;
-      try{ docsData.value = await api('/admin/docs?page='+p+'&size=20&q='+encodeURIComponent(docQuery.value)); }
-      catch(e){ toast(e.message,'err'); }
+      docsLoading.value = true;
+      try{
+        // 只请求选中的节点，绝不并发拉全部节点
+        const qs = '/admin/docs?page='+p+'&size='+docSize.value
+          +'&q='+encodeURIComponent(docQuery.value)
+          +'&node_id='+encodeURIComponent(docNode.value||'');
+        const d = await api(qs);
+        docsData.value = d;
+      }catch(e){ toast(e.message,'err'); }
+      finally{ docsLoading.value = false; }
     }
     async function loadLogs(){ try{ logs.value = (await api('/admin/crawl/logs')).logs || []; }catch(e){ toast(e.message,'err'); } }
     async function loadNodes(){
@@ -987,7 +1078,7 @@ createApp({
         const d = await api('/admin/nodes');
         nodes.value = d.nodes || [];
         nodeMeta.value = {replica_factor:d.replica_factor, require_auth:d.require_auth,
-          self_id:d.self_id, join_bases:d.join_bases||[]};
+          self_id:d.self_id, join_bases:d.join_bases||[], primary_counts:d.primary_counts||{}};
       }catch(e){ toast(e.message,'err'); }
     }
     async function loadRules(){ try{ rules.value = (await api('/admin/rules')).rules || []; }catch(e){ toast(e.message,'err'); } }
@@ -1069,7 +1160,45 @@ createApp({
       }catch(e){ toast(e.message,'err'); }
     }
     function copyCmd(){ navigator.clipboard && navigator.clipboard.writeText(joinCmd.value); toast('命令已复制'); }
-    async function loadAssign(){ try{ assignments.value = (await api('/admin/assignments')).assignments || []; }catch(e){ toast(e.message,'err'); } }
+    async function loadAssign(){
+      try{
+        const d = await api('/admin/assignments');
+        assignments.value = d.assignments || [];
+        if(d.primary_counts) nodeMeta.value = {...nodeMeta.value, primary_counts: d.primary_counts};
+        shardPolicies.value = (await api('/admin/shards')).shards || [];
+      }catch(e){ toast(e.message,'err'); }
+    }
+    async function doRebalance(){
+      rebalancing.value = true;
+      try{
+        const r = await api('/admin/assign/rebalance',{method:'POST',body:'{}'});
+        toast('已迁移 '+r.moved+' 个分片');
+        await loadAssign(); await loadNodes();
+      }catch(e){ toast(e.message,'err'); }
+      finally{ rebalancing.value = false; }
+    }
+    async function autoShard(){
+      try{
+        const r = await api('/admin/shards',{method:'POST',body:JSON.stringify({auto:true})});
+        toast('自动分片：调整 '+r.adjusted+' 个域名');
+        await loadAssign();
+      }catch(e){ toast(e.message,'err'); }
+    }
+    async function setShards(domain, n){
+      try{
+        await api('/admin/shards',{method:'POST',body:JSON.stringify({domain:domain, shards:n})});
+        toast(domain+' 分片数设为 '+n);
+        await loadAssign();
+      }catch(e){ toast(e.message,'err'); }
+    }
+    async function moveRoute(a){
+      const target = prompt('把 '+a.domain+' #'+a.shard+' 的主副本改到哪个节点？\n可选：'+nodes.value.map(x=>x.node_id).join(', '));
+      if(!target) return;
+      try{
+        await api('/admin/assign/move',{method:'POST',body:JSON.stringify({domain:a.domain, shard:a.shard, node_id:target})});
+        toast('已改派'); await loadAssign();
+      }catch(e){ toast(e.message,'err'); }
+    }
     async function loadQLogs(){ try{ qLogs.value = (await api('/admin/query-logs')).logs || []; }catch(e){ toast(e.message,'err'); } }
 
     async function startCrawl(){
@@ -1094,12 +1223,42 @@ createApp({
         seeds.value = (await api('/admin/seeds')).seeds || [];
       }catch(e){ toast(e.message,'err'); }
     }
-    async function doSearch(){
+    let sugTimer = null;
+    function onQueryInput(){
+      const q = searchQuery.value.trim();
+      if(!q){ sugItems.value=[]; showSug.value=false; return; }
+      clearTimeout(sugTimer);
+      sugTimer = setTimeout(async ()=>{
+        try{
+          const d = await api('/admin/suggest?q='+encodeURIComponent(q));
+          sugItems.value = (d.items||[]).slice(0,8);
+          showSug.value = sugItems.value.length>0;
+        }catch(e){ /* 联想失败不影响搜索 */ }
+      }, 180);
+    }
+    function pickSug(t){ searchQuery.value = t; showSug.value=false; doSearch(1); }
+    function hideSug(){ setTimeout(()=>{ showSug.value=false; },120); }
+
+    async function doSearch(p){
       if(!searchQuery.value.trim()) return;
+      const page = Math.max(1, p || 1);
       searching.value=true;
-      try{ searchRes.value = await api('/admin/search',{method:'POST',body:JSON.stringify({query:searchQuery.value, top_k:20})}); }
+      try{
+        searchRes.value = await api('/admin/search',{method:'POST',body:JSON.stringify({
+          query: searchQuery.value, size: searchSize.value, page: page
+        })});
+      }
       catch(e){ toast(e.message,'err'); }
       finally{ searching.value=false; }
+    }
+    // 高亮：先转义再包 mark，避免抓来的页面内容被当成 HTML 执行
+    function hl(text){
+      if(!text) return '';
+      const esc = String(text).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      const words = (searchRes.value && searchRes.value.tokens || []).filter(t=>t && t.length>1)
+        .map(t=>t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
+      if(!words.length) return esc;
+      return esc.replace(new RegExp('('+words.join('|')+')','gi'), '<mark>$1</mark>');
     }
     async function saveConfig(){
       try{
@@ -1142,7 +1301,9 @@ createApp({
     });
 
     return { token, adminName, page, sideOpen, loading, logging, loginErr, loginForm,
-      overview, docsData, docQuery, seeds, hot, crawl, logs, nodes, assignments,
+      overview, docsData, docQuery, docNode, docSize, docsLoading, selfId, hl, searchSize,
+      shardPolicies, rebalancing, doRebalance, autoShard, setShards, moveRoute,
+      sugItems, showSug, onQueryInput, pickSug, hideSug, seeds, hot, crawl, logs, nodes, assignments,
       searchQuery, searchRes, searching, qLogs, config, keys, enqueueText, hdrKey, hdrVal,
       toasts, showKeyModal, createdKey, newKey, newSeed,
       nodeMeta, showNodeModal, joinCmd, nodeForm, rules, ruleQuery, filteredRules,
