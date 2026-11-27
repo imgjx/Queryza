@@ -187,7 +187,7 @@ func (s *Searcher) search(ctx context.Context, query string, topK int, allow map
 	}
 
 	sort.SliceStable(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
-	total := len(hits)
+	total := len(cand)
 	if len(hits) > topK {
 		hits = hits[:topK]
 	}

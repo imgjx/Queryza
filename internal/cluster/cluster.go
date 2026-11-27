@@ -387,7 +387,11 @@ func (m *Master) AssignDomain(domain string) string {
 	m.asgMu.Unlock()
 
 	if created {
-		m.invalidateDomains()
+		// 只让「节点 → 域名列表」缓存过期。
+		// 原来调用 invalidateDomains 会连 asgCache 一起清空，
+		// 而抓取时每发现一个新域名就会触发一次，导致已有域名的归属缓存
+		// 被反复清掉、每个页面都要回查数据库。新域名不影响老域名的归属。
+		m.invalidateDomainList()
 	}
 	return primary
 }
@@ -450,13 +454,18 @@ func (m *Master) OwnDomain(domain string) bool {
 func (m *Master) OwnedDomains() []string { return m.DomainsOf(m.cfg.Cluster.NodeID) }
 
 func (m *Master) invalidateDomains() {
-	m.domMu.Lock()
-	m.domAt = time.Time{}
-	m.domMu.Unlock()
+	m.invalidateDomainList()
 	// 副本组变化（提主/再均衡/删节点）后，归属缓存必须同步失效
 	m.asgMu.Lock()
 	m.asgCache = map[string]*asgEntry{}
 	m.asgMu.Unlock()
+}
+
+// invalidateDomainList 只让域名列表缓存过期，保留逐域名归属缓存。
+func (m *Master) invalidateDomainList() {
+	m.domMu.Lock()
+	m.domAt = time.Time{}
+	m.domMu.Unlock()
 }
 
 // DomainsOf 返回节点负责的主副本域名（5 秒缓存）。

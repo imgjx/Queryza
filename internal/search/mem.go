@@ -144,7 +144,8 @@ func (s *Searcher) searchMem(ctx context.Context, query string, tokens []string,
 	}
 
 	sort.SliceStable(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
-	total := len(hits)
+	// total 反映真实命中文档数（倒排召回量），不是这一页的条数
+	total := len(cand)
 	if len(hits) > topK {
 		hits = hits[:topK]
 	}
