@@ -195,9 +195,12 @@ func (s *Searcher) search(ctx context.Context, query string, topK int, allow map
 		return r, nil
 	}
 
-	limit := topK * 5
+	limit := topK
 	if s.cfg.RerankTopN > limit {
 		limit = s.cfg.RerankTopN
+	}
+	if limit > 500 {
+		limit = 500
 	}
 	ids := topN(cand, limit)
 

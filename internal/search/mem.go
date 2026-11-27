@@ -82,13 +82,13 @@ func (s *Searcher) searchMem(ctx context.Context, query string, tokens []string,
 			TookMS: int(time.Since(start).Milliseconds()), Hits: []store.SearchHit{}, NodeID: s.nodeID}, nil
 	}
 
-	// 只回表取少量候选的正文：站点权重/新鲜度都在内存里，重排不需要太多候选
-	limit := topK * 3
+	// 分页时 topK 已包含 offset，直接按需取；上限 500 条防止深翻页拖垮回表
+	limit := topK
 	if limit < 40 {
 		limit = 40
 	}
-	if limit > 200 {
-		limit = 200
+	if limit > 500 {
+		limit = 500
 	}
 	ids := topN(cand, limit)
 

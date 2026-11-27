@@ -71,6 +71,9 @@ type ClusterConfig struct {
 	ShardDocsPerNode int `yaml:"shard_docs_per_node"`
 	// AutoShard 是否按文档量自动调整分片
 	AutoShard bool `yaml:"auto_shard"`
+	// MasterID / MasterSecret 由节点 enroll 时下发，用于校验主节点签名
+	MasterID     string `yaml:"-"`
+	MasterSecret string `yaml:"-"`
 	// Version 由主程序写入，随注册上报
 	Version string `yaml:"-"`
 }

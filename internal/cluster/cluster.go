@@ -73,6 +73,8 @@ type EnrollResp struct {
 	NodeID   string `json:"node_id"`
 	Secret   string `json:"secret"`
 	MasterID string `json:"master_id"`
+	// MasterSecret 主节点密钥，仅用于让子节点校验主节点下发的内部请求
+	MasterSecret string `json:"master_secret"`
 }
 
 // Master 中心调度：节点注册、心跳、域名多副本分配、检索路由与结果合并。
@@ -235,6 +237,10 @@ func (m *Master) Register(req RegisterReq) error {
 	}
 	if req.Weight <= 0 {
 		req.Weight = 1
+	}
+	// 管理端显式设过权重就以管理端为准，节点心跳不要把它改回去
+	if ok && n.Weight > 0 && req.NodeID != m.cfg.Cluster.NodeID {
+		req.Weight = n.Weight
 	}
 	if req.Role == "" {
 		req.Role = "node"
@@ -569,7 +575,12 @@ func (m *Master) Search(ctx context.Context, query string, topK, offset int) (*s
 	best := map[string]store.SearchHit{}
 	var tokens []string
 	var failed []string
+	// 每个域名只归一个节点，各节点 total 相加即为全局召回量
+	totalHits := 0
 	for _, nr := range results {
+		if nr.res != nil {
+			totalHits += nr.res.Total
+		}
 		if len(tokens) == 0 && nr.res != nil && len(nr.res.Tokens) > 0 {
 			tokens = nr.res.Tokens
 		}
@@ -606,7 +617,10 @@ func (m *Master) Search(ctx context.Context, query string, topK, offset int) (*s
 		hits = append(hits, h)
 	}
 	sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
-	total := len(hits)
+	total := totalHits
+	if total < len(hits) {
+		total = len(hits)
+	}
 	if offset >= len(hits) {
 		hits = []store.SearchHit{}
 	} else {
@@ -688,6 +702,41 @@ func (m *Master) replicaSearch(ctx context.Context, failedNode, query string, to
 	}
 	r, err := m.remoteSearchDomains(ctx, *target, query, topK, domains)
 	return r, *target, err
+}
+
+// OwnedRoute 节点负责的一个域名分片。
+type OwnedRoute struct {
+	Domain string `json:"domain"`
+	Shard  int    `json:"shard"`
+}
+
+// OwnedRoutes 返回该节点作为主副本的全部分片，供子节点同步本地归属表。
+func (m *Master) OwnedRoutes(nodeID string) ([]OwnedRoute, map[string]int) {
+	rows, err := m.db.Query(`SELECT domain,shard FROM domain_replicas
+		WHERE node_id=? AND role='primary'`, nodeID)
+	var out []OwnedRoute
+	if err == nil {
+		for rows.Next() {
+			var r OwnedRoute
+			if rows.Scan(&r.Domain, &r.Shard) == nil {
+				out = append(out, r)
+			}
+		}
+		rows.Close()
+	}
+	shards := map[string]int{}
+	srows, err := m.db.Query(`SELECT domain,shards FROM domain_shards`)
+	if err == nil {
+		for srows.Next() {
+			var d string
+			var n int
+			if srows.Scan(&d, &n) == nil {
+				shards[d] = n
+			}
+		}
+		srows.Close()
+	}
+	return out, shards
 }
 
 // NodeDocs 拉取指定节点的文档库分页数据；nodeID 为空或本节点时直接查本地库。
@@ -847,9 +896,7 @@ func (m *Master) CreateNode(nodeID, name, addr string, weight float64) (string, 
 	if nodeID == "" {
 		nodeID = "node-" + RandToken(3)
 	}
-	if weight <= 0 {
-		weight = 1
-	}
+	// weight=0 表示「跟随节点自己上报」，非 0 则锁定为管理端设置
 	secret := RandToken(24)
 	_, err := m.db.Exec(`INSERT INTO nodes(node_id,name,addr,role,status,weight,enabled,secret,config)
 		VALUES(?,?,?,'node','pending',?,0,?,'')
@@ -915,9 +962,8 @@ func (m *Master) SetNodeWeight(nodeID string, weight float64) error {
 // refreshSelfCount 统计本节点负责的文档数，供后台展示。
 func (m *Master) refreshSelfCount(ctx context.Context) {
 	var n int64
-	m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM documents d
-		JOIN domain_replicas r ON r.domain=d.domain AND r.node_id=? AND r.role='primary'`,
-		m.cfg.Cluster.NodeID).Scan(&n)
+	// 本节点库里的文档就是本节点抓的，按分配表 JOIN 会漏掉正在迁移分片的域名
+	m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM documents`).Scan(&n)
 	m.db.ExecContext(ctx, `UPDATE nodes SET doc_count=?,last_ip=COALESCE(NULLIF(last_ip,''),?) WHERE node_id=?`,
 		n, hostPart(m.cfg.Cluster.AdvertiseAddr), m.cfg.Cluster.NodeID)
 	m.mu.Lock()
@@ -966,9 +1012,11 @@ func (m *Master) StartMaintenance(ctx context.Context) {
 // ---------- 子节点 Agent ----------
 
 type identity struct {
-	NodeID string `json:"node_id"`
-	Secret string `json:"secret"`
-	Master string `json:"master"`
+	NodeID       string `json:"node_id"`
+	Secret       string `json:"secret"`
+	Master       string `json:"master"`
+	MasterID     string `json:"master_id"`
+	MasterSecret string `json:"master_secret"`
 }
 
 // Agent 运行在子节点上：按主地址表顺序连接，失败自动切换。
@@ -983,7 +1031,13 @@ type Agent struct {
 	secret  string
 	nodeID  string
 	token   string
+
+	// apply 由主程序注入，用于把归属写进本地库
+	apply func([]OwnedRoute, map[string]int)
 }
+
+// SetOwnedApplier 注入归属表落库函数。
+func (a *Agent) SetOwnedApplier(f func([]OwnedRoute, map[string]int)) { a.apply = f }
 
 func NewAgent(cfg *config.Config, advertiseAddr string) *Agent {
 	a := &Agent{
@@ -1014,11 +1068,20 @@ func (a *Agent) loadIdentity() {
 	if a.secret == "" {
 		a.secret = id.Secret
 	}
+	// 服务端内部鉴权与对外签名都要用这把密钥
+	if a.secret != "" {
+		a.cfg.Cluster.Secret = a.secret
+	}
 	if a.nodeID == "" || a.nodeID == "node-local" {
 		if id.NodeID != "" {
 			a.nodeID = id.NodeID
 			a.cfg.Cluster.NodeID = id.NodeID
 		}
+	}
+	// 主节点身份：子节点靠它校验主节点签名的内部请求
+	if id.MasterID != "" {
+		a.cfg.Cluster.MasterID = id.MasterID
+		a.cfg.Cluster.MasterSecret = id.MasterSecret
 	}
 }
 
@@ -1026,7 +1089,10 @@ func (a *Agent) saveIdentity() {
 	if a.cfg.Cluster.IdentityFile == "" {
 		return
 	}
-	b, _ := json.MarshalIndent(identity{NodeID: a.nodeID, Secret: a.secret, Master: a.currentMaster()}, "", "  ")
+	b, _ := json.MarshalIndent(identity{
+		NodeID: a.nodeID, Secret: a.secret, Master: a.currentMaster(),
+		MasterID: a.cfg.Cluster.MasterID, MasterSecret: a.cfg.Cluster.MasterSecret,
+	}, "", "  ")
 	writeFile(a.cfg.Cluster.IdentityFile, b)
 }
 
@@ -1089,9 +1155,14 @@ func (a *Agent) Enroll(ctx context.Context) error {
 		}
 		a.mu.Lock()
 		a.secret = er.Secret
+		a.cfg.Cluster.Secret = er.Secret
 		if er.NodeID != "" {
 			a.nodeID = er.NodeID
 			a.cfg.Cluster.NodeID = er.NodeID
+		}
+		if er.MasterID != "" {
+			a.cfg.Cluster.MasterID = er.MasterID
+			a.cfg.Cluster.MasterSecret = er.MasterSecret
 		}
 		a.cur = i
 		a.mu.Unlock()
@@ -1102,6 +1173,51 @@ func (a *Agent) Enroll(ctx context.Context) error {
 		lastErr = errors.New("所有主节点地址均不可达")
 	}
 	return lastErr
+}
+
+// SyncOwned 从主节点拉取自己的域名分片归属，写入本地库。
+func (a *Agent) SyncOwned(ctx context.Context) error {
+	a.mu.Lock()
+	n := len(a.masters)
+	cur := a.cur
+	a.mu.Unlock()
+	if n == 0 {
+		return errors.New("未配置主节点")
+	}
+	for i := 0; i < n; i++ {
+		idx := (cur + i) % n
+		a.mu.Lock()
+		base := a.masters[idx]
+		nodeID := a.nodeID
+		a.mu.Unlock()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(base, "/internal/owned?node_id="+nodeID), nil)
+		if err != nil {
+			continue
+		}
+		SignRequest(req, a.Secret(), nodeID, nil)
+		resp, err := a.client.Do(req)
+		if err != nil {
+			continue
+		}
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("拉取归属失败: HTTP %d %s", resp.StatusCode, firstLine(string(b), 120))
+		}
+		var out struct {
+			OK     bool                 `json:"ok"`
+			Routes []OwnedRoute         `json:"routes"`
+			Shards map[string]int       `json:"shards"`
+		}
+		if json.Unmarshal(b, &out) != nil || !out.OK {
+			return fmt.Errorf("归属响应异常: %s", firstLine(string(b), 120))
+		}
+		if a.apply != nil {
+			a.apply(out.Routes, out.Shards)
+		}
+		return nil
+	}
+	return errors.New("同步归属失败")
 }
 
 func (a *Agent) Register(ctx context.Context, docCount int64, cfgStr string) error {
@@ -1206,4 +1322,30 @@ func writeFile(path string, b []byte) {
 		return
 	}
 	os.WriteFile(path, b, 0o600)
+}
+
+// SyncOwned 把主节点下发的归属表写入本地库。
+// 节点库没有分配表时，AssignRoute 会把所有域名都分给自己，
+// 结果两个节点重复抓同一批站点，看起来就是「都在抓但谁也没分片」。
+func (m *Master) SyncOwned(routes []OwnedRoute, shards map[string]int) {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return
+	}
+	tx.Exec(`DELETE FROM domain_replicas`)
+	for _, r := range routes {
+		tx.Exec(`INSERT IGNORE INTO domain_replicas(domain,shard,node_id,role,weight)
+			VALUES(?,?,?,'primary',1)`, r.Domain, r.Shard, m.cfg.Cluster.NodeID)
+	}
+	for d, n := range shards {
+		if n > 1 {
+			tx.Exec(`INSERT INTO domain_shards(domain,shards) VALUES(?,?)
+				ON DUPLICATE KEY UPDATE shards=VALUES(shards)`, d, n)
+		}
+	}
+	tx.Commit()
+	m.invalidateDomains()
+	m.shardMu.Lock()
+	m.shards = nil
+	m.shardMu.Unlock()
 }

@@ -65,6 +65,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/internal/assign", s.handleAssign)
 	mux.HandleFunc("/internal/ping", s.handlePing)
 	mux.HandleFunc("/internal/docs", s.handleInternalDocs)
+	mux.HandleFunc("/internal/owned", s.handleInternalOwned)
 
 	// 子节点只提供内部接口：不带管理界面，也不对外暴露检索 API
 	if s.cfg.Cluster.Role == "node" {
@@ -129,6 +130,10 @@ func (s *Server) requireInternal(w http.ResponseWriter, r *http.Request) (string
 		if id == s.cfg.Cluster.NodeID {
 			return s.cfg.Cluster.Secret, nil
 		}
+		// 子节点库里没有主节点记录，用 enroll 时下发的主节点密钥校验
+		if id == s.cfg.Cluster.MasterID && s.cfg.Cluster.MasterSecret != "" {
+			return s.cfg.Cluster.MasterSecret, nil
+		}
 		return s.master.NodeSecret(id)
 	})
 	if err != nil {
@@ -167,7 +172,8 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, cluster.EnrollResp{
-		OK: true, NodeID: nodeID, Secret: secret, MasterID: s.cfg.Cluster.NodeID,
+		OK: true, NodeID: nodeID, Secret: secret,
+		MasterID: s.cfg.Cluster.NodeID, MasterSecret: s.cfg.Cluster.Secret,
 	})
 }
 
@@ -197,6 +203,19 @@ func (s *Server) handleInternalCrawl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "running": s.crawlRunning()})
+}
+
+// handleInternalOwned 把「本节点负责哪些域名分片」下发给子节点。
+func (s *Server) handleInternalOwned(w http.ResponseWriter, r *http.Request) {
+	nodeID, _, ok := s.requireInternal(w, r)
+	if !ok {
+		return
+	}
+	if q := r.URL.Query().Get("node_id"); q != "" {
+		nodeID = q
+	}
+	routes, shards := s.master.OwnedRoutes(nodeID)
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "routes": routes, "shards": shards})
 }
 
 func (s *Server) handleInternalDocs(w http.ResponseWriter, r *http.Request) {

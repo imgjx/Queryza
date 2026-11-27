@@ -146,6 +146,8 @@ func main() {
 	if cfg.Cluster.Role == "node" && len(cfg.Cluster.MasterAddrs) > 0 {
 		agent := cluster.NewAgent(cfg, cfg.Cluster.AdvertiseAddr)
 		srv.SetAgent(agent)
+		// 归属表落库：节点库没有分配表会误把自己当所有域名的主副本，导致重复抓全站
+		agent.SetOwnedApplier(master.SyncOwned)
 		go func() {
 			if agent.Secret() == "" {
 				if err := agent.Enroll(ctx); err != nil {
@@ -159,6 +161,9 @@ func main() {
 				if err := agent.Register(ctx, dc, string(selfCfg)); err != nil {
 					log.Printf("注册失败，尝试下一个主节点地址: %v", err)
 				}
+			}
+			if err := agent.SyncOwned(ctx); err != nil {
+				log.Printf("同步归属失败: %v", err)
 			}
 			report()
 
@@ -179,6 +184,9 @@ func main() {
 					agent.ResetPreference()
 					report()
 				case <-t.C:
+					if err := agent.SyncOwned(ctx); err != nil {
+						log.Printf("同步归属失败: %v", err)
+					}
 					dc := countOwned(db, cfg.Cluster.NodeID)
 					if err := agent.Heartbeat(ctx, dc, string(selfCfg)); err != nil {
 						log.Printf("心跳失败: %v", err)
@@ -331,10 +339,12 @@ func normalizePath(p string) string {
 }
 
 // countOwned 统计本节点负责的域名下已入库的文档数
-func countOwned(db *store.DB, nodeID string) int64 {
+// countOwned 统计本节点已入库文档数。
+// 节点库里的文档就是本节点自己抓的，不需要按 domain_replicas 过滤
+// （节点库根本没有分配表，JOIN 会一直返回 0）。
+func countOwned(db *store.DB, _ string) int64 {
 	var n int64
-	db.QueryRow(`SELECT COUNT(*) FROM documents d
-		JOIN domain_replicas r ON r.domain=d.domain AND r.node_id=? AND r.role='primary'`, nodeID).Scan(&n)
+	db.QueryRow(`SELECT COUNT(*) FROM documents`).Scan(&n)
 	return n
 }
 
